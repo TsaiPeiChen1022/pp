@@ -64,19 +64,7 @@ void write_png(const char* filename, int iters, int width, int height, const int
 }
 
 void* mandelbrot_thread(void* arg) {
-    struct thread_data {
-        int thread_id;
-        int num_threads;
-        int iters;
-        double left;
-        double right;
-        double lower;
-        double upper;
-        int width;
-        int height;
-        int* image;
-    };
-    struct thread_data* data = (struct thread_data*)arg;
+    thread_data_t* data = (thread_data_t*)arg;
 
     for (int j = data->thread_id; j < data->height; j += data->num_threads) {
         double y0_val = j * ((data->upper - data->lower) / data->height) + data->lower;
@@ -85,7 +73,8 @@ void* mandelbrot_thread(void* arg) {
         double dx = (data->right - data->left) / data->width;
         double left = data->left;
 
-        for (int i = 0; i < data->width; i += 8) {
+        int i = 0;
+        for (; i <= data->width - 8; i += 8) {
             double x0_vals[8];
             for (int k = 0; k < 8; ++k) {
                 x0_vals[k] = (i + k) * dx + left;
@@ -96,26 +85,53 @@ void* mandelbrot_thread(void* arg) {
             __m512d y = _mm512_setzero_pd();
             __m512d length_squared = _mm512_setzero_pd();
             
-            __m512i int_iters = _mm512_setzero_si512(); 
-
+            int repeats[8] = {0}; 
             int iter = 0;
-            while (iter < data->iters) {
-                __mmask8 mask = _mm512_cmp_pd_mask(length_squared, _mm512_set1_pd(4.0), _MM_CMPINT_LT);
-                if (mask == 0) break;
 
+            while (iter < data->iters) {
+                __mmask8 active_mask = _mm512_cmp_pd_mask(length_squared, _mm512_set1_pd(4.0), _MM_CMPINT_LT);
+                
+                if (active_mask == 0) break;
+                for (int k = 0; k < 8; ++k) {
+                    if ((active_mask >> k) & 1) {
+                        repeats[k]++;
+                    }
+                }
                 __m512d x2 = _mm512_mul_pd(x, x);
                 __m512d y2 = _mm512_mul_pd(y, y);
                 __m512d xy = _mm512_mul_pd(x, y);
                 
                 __m512d temp = _mm512_add_pd(_mm512_sub_pd(x2, y2), x0);
-                y = _mm512_add_pd(_mm512_add_pd(xy, xy), y0);
-                x = temp;
+                __m512d next_y = _mm512_add_pd(_mm512_add_pd(xy, xy), y0);
 
-                length_squared = _mm512_add_pd(_mm512_mul_pd(x, x), _mm512_mul_pd(y, y)); 
+                x = _mm512_mask_mov_pd(x, active_mask, temp);
+                y = _mm512_mask_mov_pd(y, active_mask, next_y);
+
+                length_squared = _mm512_add_pd(_mm512_mul_pd(x, x), _mm512_mul_pd(y, y));
+
                 iter++;
             }
+
+            for (int k = 0; k < 8; ++k) {
+                data->image[j * data->width + (i + k)] = repeats[k];
+            }
+        }
+
+        for (; i < data->width; ++i) {
+            double x0 = i * dx + left;
+            int repeats = 0;
+            double x = 0, y = 0, length_squared = 0;
+            while (repeats < data->iters && length_squared < 4) {
+                double temp = x * x - y * y + x0;
+                y = 2 * x * y + y0_val;
+                x = temp;
+                length_squared = x * x + y * y;
+                ++repeats;
+            }
+            data->image[j * data->width + i] = repeats;
         }
     }
+    
     return NULL;
 }
 
@@ -136,12 +152,15 @@ int main(int argc, char** argv) {
     int width = strtol(argv[7], 0, 10);
     int height = strtol(argv[8], 0, 10);
 
-
     int num_threads = 0;
     char *env_cpus = getenv("SLURM_CPUS_PER_TASK");
     if (env_cpus != NULL) {
         num_threads = atoi(env_cpus);
     }
+    if (num_threads <= 0) {
+        num_threads = sysconf(_SC_NPROCESSORS_ONLN);
+    }
+    assert(num_threads > 0);
 
     struct timespec start_calculation_time, end_calculation_time;
     struct timespec start_write_time, end_write_time;
@@ -174,19 +193,21 @@ int main(int argc, char** argv) {
         pthread_join(threads[i], NULL);
     }
     clock_gettime(CLOCK_MONOTONIC, &end_calculation_time);
-    
 
     free(threads);
     free(thread_data);
+
     /* draw and cleanup */
     clock_gettime(CLOCK_MONOTONIC, &start_write_time);
     write_png(filename, iters, width, height, image);
     free(image);
     clock_gettime(CLOCK_MONOTONIC, &end_write_time);
+
     double calc_time = (end_calculation_time.tv_sec - start_calculation_time.tv_sec) + 
-                   (end_calculation_time.tv_nsec - start_calculation_time.tv_nsec) / 1e9;
+                       (end_calculation_time.tv_nsec - start_calculation_time.tv_nsec) / 1e9;
     double write_time = (end_write_time.tv_sec - start_write_time.tv_sec) + 
-                    (end_write_time.tv_nsec - start_write_time.tv_nsec) / 1e9;
+                        (end_write_time.tv_nsec - start_write_time.tv_nsec) / 1e9;
     printf("Calculation time: %.9f seconds\n", calc_time);
     printf("Write time: %.9f seconds\n", write_time);
+    return 0;
 }
