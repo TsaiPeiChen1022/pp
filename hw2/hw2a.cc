@@ -65,90 +65,149 @@ void write_png(const char* filename, int iters, int width, int height, const int
     fclose(fp);
 }
 
+
 void* mandelbrot_thread(void* arg) {
     thread_data_t* data = (thread_data_t*)arg;
 
+    const int W = data->width;
+    const int H = data->height;
+    const int max_iters = data->iters;
+
+    const double dx = (data->right - data->left) / W;
+    const double dy = (data->upper - data->lower) / H;
+
     while (1) {
-        /* 1. 動態取得下一行要計算的工作 (使用 Mutex 確保執行緒安全) */
+        /* Dynamically acquire a row */
         pthread_mutex_lock(data->row_mutex);
-        int j = *(data->global_row);
-        (*(data->global_row))++;
+        int j = (*(data->global_row))++;
         pthread_mutex_unlock(data->row_mutex);
 
-        /* 2. 如果行號超過圖片高度，代表所有工作已完成，結束執行緒 */
-        if (j >= data->height) {
+        if (j >= H)
             break;
+
+        const double y0_val = j * dy + data->lower;
+
+        /*
+         * Each SIMD lane owns an independent pixel.
+         * A completed lane is immediately refilled with
+         * the next unprocessed pixel in this row.
+         */
+        double x0_arr[8] = {0};
+        double y0_arr[8] = {0};
+        double x_arr[8] = {0};
+        double y_arr[8] = {0};
+        double ls_arr[8] = {0};
+
+        int pixel_x[8] = {0};
+        int repeats[8] = {0};
+        int lane_active[8] = {0};
+
+        int next_x = 0;
+
+        /* Initially fill the 8 SIMD lanes */
+        for (int k = 0; k < 8; ++k) {
+            if (next_x < W) {
+                pixel_x[k] = next_x++;
+                x0_arr[k] = pixel_x[k] * dx + data->left;
+                y0_arr[k] = y0_val;
+
+                x_arr[k] = 0.0;
+                y_arr[k] = 0.0;
+                ls_arr[k] = 0.0;
+                repeats[k] = 0;
+                lane_active[k] = 1;
+            }
         }
 
-        double y0_val = j * ((data->upper - data->lower) / data->height) + data->lower;
-        __m512d y0 = _mm512_set1_pd(y0_val); 
-
-        double dx = (data->right - data->left) / data->width;
-        double left = data->left;
-
-        int i = 0;
-        /* 3. AVX-512 8通道批次運算迴圈 */
-        for (; i <= data->width - 8; i += 8) {
-            double x0_vals[8];
+        while (1) {
+            /*
+             * 1. Retire completed pixels and refill their lanes.
+             *
+             * Match the scalar loop:
+             * while (repeats < max_iters && ls < 4.0)
+             */
             for (int k = 0; k < 8; ++k) {
-                x0_vals[k] = (i + k) * dx + left;
-            }
-            __m512d x0 = _mm512_loadu_pd(x0_vals);
+                if (lane_active[k] &&
+                    (repeats[k] >= max_iters ||
+                     ls_arr[k] >= 4.0)) {
 
-            __m512d x = _mm512_setzero_pd();
-            __m512d y = _mm512_setzero_pd();
-            __m512d length_squared = _mm512_setzero_pd();
-            
-            int repeats[8] = {0}; 
-            int iter = 0;
+                    data->image[j * W + pixel_x[k]] = repeats[k];
 
-            while (iter < data->iters) {
-                __mmask8 active_mask = _mm512_cmp_pd_mask(length_squared, _mm512_set1_pd(4.0), _MM_CMPINT_LT);
-                
-                if (active_mask == 0) break;
-                for (int k = 0; k < 8; ++k) {
-                    if ((active_mask >> k) & 1) {
-                        repeats[k]++;
+                    if (next_x < W) {
+                        /* Refill this lane with a new pixel */
+                        pixel_x[k] = next_x++;
+                        x0_arr[k] = pixel_x[k] * dx + data->left;
+                        y0_arr[k] = y0_val;
+
+                        x_arr[k] = 0.0;
+                        y_arr[k] = 0.0;
+                        ls_arr[k] = 0.0;
+                        repeats[k] = 0;
+                        lane_active[k] = 1;
+                    } else {
+                        lane_active[k] = 0;
                     }
                 }
-                __m512d x2 = _mm512_mul_pd(x, x);
-                __m512d y2 = _mm512_mul_pd(y, y);
-                __m512d xy = _mm512_mul_pd(x, y);
-                
-                __m512d temp = _mm512_add_pd(_mm512_sub_pd(x2, y2), x0);
-                __m512d next_y = _mm512_add_pd(_mm512_add_pd(xy, xy), y0);
-
-                x = _mm512_mask_mov_pd(x, active_mask, temp);
-                y = _mm512_mask_mov_pd(y, active_mask, next_y);
-
-                length_squared = _mm512_add_pd(_mm512_mul_pd(x, x), _mm512_mul_pd(y, y));
-
-                iter++;
             }
+
+            /* 2. Construct the mask of currently active lanes */
+            __mmask8 mask = 0;
 
             for (int k = 0; k < 8; ++k) {
-                data->image[j * data->width + (i + k)] = repeats[k];
+                if (lane_active[k])
+                    mask |= ((__mmask8)1 << k);
             }
-        }
 
-        /* 4. 尾數補齊 (Tail Handling - 純量處理剩餘像素) */
-        for (; i < data->width; ++i) {
-            double x0 = i * dx + left;
-            int repeats = 0;
-            double x = 0.0, y = 0.0, length_squared = 0.0;
-            while (repeats < data->iters && length_squared < 4.0) {
-                double temp = x * x - y * y + x0;
-                y = 2.0 * x * y + y0_val;
-                x = temp;
-                length_squared = x * x + y * y;
-                ++repeats;
+            if (mask == 0)
+                break;
+
+            /*
+             * 3. SIMD Mandelbrot iteration.
+             * Inactive lanes retain their previous state.
+             */
+            __m512d x = _mm512_loadu_pd(x_arr);
+            __m512d y = _mm512_loadu_pd(y_arr);
+            __m512d x0 = _mm512_loadu_pd(x0_arr);
+            __m512d y0 = _mm512_loadu_pd(y0_arr);
+            __m512d ls = _mm512_loadu_pd(ls_arr);
+
+            __m512d x2 = _mm512_mul_pd(x, x);
+            __m512d y2 = _mm512_mul_pd(y, y);
+            __m512d xy = _mm512_mul_pd(x, y);
+
+            __m512d next_x_vec =
+                _mm512_add_pd(
+                    _mm512_sub_pd(x2, y2), x0);
+
+            __m512d next_y_vec =
+                _mm512_add_pd(
+                    _mm512_add_pd(xy, xy), y0);
+
+            x = _mm512_mask_mov_pd(x, mask, next_x_vec);
+            y = _mm512_mask_mov_pd(y, mask, next_y_vec);
+
+            __m512d next_ls =
+                _mm512_add_pd(
+                    _mm512_mul_pd(x, x),
+                    _mm512_mul_pd(y, y));
+
+            ls = _mm512_mask_mov_pd(ls, mask, next_ls);
+
+            _mm512_storeu_pd(x_arr, x);
+            _mm512_storeu_pd(y_arr, y);
+            _mm512_storeu_pd(ls_arr, ls);
+
+            /* Each active pixel advances by one iteration */
+            for (int k = 0; k < 8; ++k) {
+                if (lane_active[k])
+                    ++repeats[k];
             }
-            data->image[j * data->width + i] = repeats;
         }
     }
-    
+
     return NULL;
 }
+
 
 int main(int argc, char** argv) {
     /* detect how many CPUs are available */
