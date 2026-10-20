@@ -11,6 +11,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
+#include <immintrin.h>
 
 typedef struct {
     int thread_id;
@@ -23,6 +24,8 @@ typedef struct {
     int width;
     int height;
     int* image;
+    int* global_row;          /* 全域行計數器指標 */
+    pthread_mutex_t* row_mutex; /* 保護全域行計數器的 Mutex */
 } thread_data_t;
 
 void write_png(const char* filename, int iters, int width, int height, const int* buffer) {
@@ -65,12 +68,71 @@ void write_png(const char* filename, int iters, int width, int height, const int
 void* mandelbrot_thread(void* arg) {
     thread_data_t* data = (thread_data_t*)arg;
 
-    for (int j = data->thread_id; j < data->height; j += data->num_threads) {
+    while (1) {
+        /* 1. 動態取得下一行要計算的工作 (使用 Mutex 確保執行緒安全) */
+        pthread_mutex_lock(data->row_mutex);
+        int j = *(data->global_row);
+        (*(data->global_row))++;
+        pthread_mutex_unlock(data->row_mutex);
+
+        /* 2. 如果行號超過圖片高度，代表所有工作已完成，結束執行緒 */
+        if (j >= data->height) {
+            break;
+        }
+
         double y0_val = j * ((data->upper - data->lower) / data->height) + data->lower;
+        __m512d y0 = _mm512_set1_pd(y0_val); 
+
         double dx = (data->right - data->left) / data->width;
         double left = data->left;
 
-        for (int i = 0; i < data->width; ++i) {
+        int i = 0;
+        /* 3. AVX-512 8通道批次運算迴圈 */
+        for (; i <= data->width - 8; i += 8) {
+            double x0_vals[8];
+            for (int k = 0; k < 8; ++k) {
+                x0_vals[k] = (i + k) * dx + left;
+            }
+            __m512d x0 = _mm512_loadu_pd(x0_vals);
+
+            __m512d x = _mm512_setzero_pd();
+            __m512d y = _mm512_setzero_pd();
+            __m512d length_squared = _mm512_setzero_pd();
+            
+            int repeats[8] = {0}; 
+            int iter = 0;
+
+            while (iter < data->iters) {
+                __mmask8 active_mask = _mm512_cmp_pd_mask(length_squared, _mm512_set1_pd(4.0), _MM_CMPINT_LT);
+                
+                if (active_mask == 0) break;
+                for (int k = 0; k < 8; ++k) {
+                    if ((active_mask >> k) & 1) {
+                        repeats[k]++;
+                    }
+                }
+                __m512d x2 = _mm512_mul_pd(x, x);
+                __m512d y2 = _mm512_mul_pd(y, y);
+                __m512d xy = _mm512_mul_pd(x, y);
+                
+                __m512d temp = _mm512_add_pd(_mm512_sub_pd(x2, y2), x0);
+                __m512d next_y = _mm512_add_pd(_mm512_add_pd(xy, xy), y0);
+
+                x = _mm512_mask_mov_pd(x, active_mask, temp);
+                y = _mm512_mask_mov_pd(y, active_mask, next_y);
+
+                length_squared = _mm512_add_pd(_mm512_mul_pd(x, x), _mm512_mul_pd(y, y));
+
+                iter++;
+            }
+
+            for (int k = 0; k < 8; ++k) {
+                data->image[j * data->width + (i + k)] = repeats[k];
+            }
+        }
+
+        /* 4. 尾數補齊 (Tail Handling - 純量處理剩餘像素) */
+        for (; i < data->width; ++i) {
             double x0 = i * dx + left;
             int repeats = 0;
             double x = 0.0, y = 0.0, length_squared = 0.0;
@@ -125,6 +187,11 @@ int main(int argc, char** argv) {
     pthread_t *threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
     thread_data_t *thread_data = (thread_data_t *)malloc(num_threads * sizeof(thread_data_t));
 
+    /* 初始化動態排程的全域變數與 Mutex */
+    int global_row = 0;
+    pthread_mutex_t row_mutex;
+    pthread_mutex_init(&row_mutex, NULL);
+
     clock_gettime(CLOCK_MONOTONIC, &start_calculation_time);
 
     for (int i = 0; i < num_threads; i++) {
@@ -138,6 +205,8 @@ int main(int argc, char** argv) {
         thread_data[i].width = width;
         thread_data[i].height = height;
         thread_data[i].image = image;
+        thread_data[i].global_row = &global_row;
+        thread_data[i].row_mutex = &row_mutex;
 
         pthread_create(&threads[i], NULL, mandelbrot_thread, (void *)&thread_data[i]);
     }
@@ -147,6 +216,8 @@ int main(int argc, char** argv) {
     }
     clock_gettime(CLOCK_MONOTONIC, &end_calculation_time);
 
+    /* 銷毀 Mutex 與釋放動態記憶體 */
+    pthread_mutex_destroy(&row_mutex);
     free(threads);
     free(thread_data);
 
