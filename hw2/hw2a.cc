@@ -11,7 +11,6 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
-#include <immintrin.h>
 
 typedef struct {
     int thread_id;
@@ -68,62 +67,16 @@ void* mandelbrot_thread(void* arg) {
 
     for (int j = data->thread_id; j < data->height; j += data->num_threads) {
         double y0_val = j * ((data->upper - data->lower) / data->height) + data->lower;
-        __m512d y0 = _mm512_set1_pd(y0_val); 
-
         double dx = (data->right - data->left) / data->width;
         double left = data->left;
 
-        int i = 0;
-        for (; i <= data->width - 8; i += 8) {
-            double x0_vals[8];
-            for (int k = 0; k < 8; ++k) {
-                x0_vals[k] = (i + k) * dx + left;
-            }
-            __m512d x0 = _mm512_loadu_pd(x0_vals);
-
-            __m512d x = _mm512_setzero_pd();
-            __m512d y = _mm512_setzero_pd();
-            __m512d length_squared = _mm512_setzero_pd();
-            
-            int repeats[8] = {0}; 
-            int iter = 0;
-
-            while (iter < data->iters) {
-                __mmask8 active_mask = _mm512_cmp_pd_mask(length_squared, _mm512_set1_pd(4.0), _MM_CMPINT_LT);
-                
-                if (active_mask == 0) break;
-                for (int k = 0; k < 8; ++k) {
-                    if ((active_mask >> k) & 1) {
-                        repeats[k]++;
-                    }
-                }
-                __m512d x2 = _mm512_mul_pd(x, x);
-                __m512d y2 = _mm512_mul_pd(y, y);
-                __m512d xy = _mm512_mul_pd(x, y);
-                
-                __m512d temp = _mm512_add_pd(_mm512_sub_pd(x2, y2), x0);
-                __m512d next_y = _mm512_add_pd(_mm512_add_pd(xy, xy), y0);
-
-                x = _mm512_mask_mov_pd(x, active_mask, temp);
-                y = _mm512_mask_mov_pd(y, active_mask, next_y);
-
-                length_squared = _mm512_add_pd(_mm512_mul_pd(x, x), _mm512_mul_pd(y, y));
-
-                iter++;
-            }
-
-            for (int k = 0; k < 8; ++k) {
-                data->image[j * data->width + (i + k)] = repeats[k];
-            }
-        }
-
-        for (; i < data->width; ++i) {
+        for (int i = 0; i < data->width; ++i) {
             double x0 = i * dx + left;
             int repeats = 0;
-            double x = 0, y = 0, length_squared = 0;
-            while (repeats < data->iters && length_squared < 4) {
+            double x = 0.0, y = 0.0, length_squared = 0.0;
+            while (repeats < data->iters && length_squared < 4.0) {
                 double temp = x * x - y * y + x0;
-                y = 2 * x * y + y0_val;
+                y = 2.0 * x * y + y0_val;
                 x = temp;
                 length_squared = x * x + y * y;
                 ++repeats;
