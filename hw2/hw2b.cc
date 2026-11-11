@@ -10,9 +10,53 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
+#include <atomic>
+#include <vector>
+#include <algorithm>
 #include <immintrin.h>
 #include <omp.h>
 #include <mpi.h>
+
+#define TH_FIELDS 6   
+#define RK_FIELDS 7   
+
+#define TAG_REQ  1
+#define TAG_RESP 2
+#define TAG_DATA 3
+
+
+static std::atomic<int> g_next_row(0);
+static int g_height = 0;
+static int g_world_size = 1;
+
+static inline int grab_chunk(int chunk, int* start) {
+    int s = g_next_row.fetch_add(chunk, std::memory_order_relaxed);
+    if (s >= g_height) return 0;
+    *start = s;
+    return std::min(chunk, g_height - s);
+}
+
+static void* server_main(void*) {
+    int finished = 0;
+    const int need = g_world_size - 1;
+    struct timespec nap = {0, 20000};   
+    while (finished < need) {
+        int flag = 0;
+        MPI_Status st;
+        MPI_Iprobe(MPI_ANY_SOURCE, TAG_REQ, MPI_COMM_WORLD, &flag, &st);
+        if (!flag) { nanosleep(&nap, NULL); continue; }
+
+        int req_chunk;
+        MPI_Recv(&req_chunk, 1, MPI_INT, st.MPI_SOURCE, TAG_REQ, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        int resp[2] = {0, 0};
+        resp[1] = grab_chunk(req_chunk, &resp[0]);
+        if (resp[1] == 0) { resp[0] = 0; finished++; }
+        MPI_Send(resp, 2, MPI_INT, st.MPI_SOURCE, TAG_RESP, MPI_COMM_WORLD);
+    }
+    return NULL;
+}
 
 void write_png(const char* filename, int iters, int width, int height, const int* buffer) {
     FILE* fp = fopen(filename, "wb");
@@ -59,11 +103,16 @@ void write_png(const char* filename, int iters, int width, int height, const int
 
 int main(int argc, char** argv) {
     int provided;
-    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_SERIALIZED, &provided);
 
     int world_rank, world_size;
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+
+    if (world_size > 1 && provided < MPI_THREAD_SERIALIZED) {
+        if (world_rank == 0) fprintf(stderr, "MPI does not provide MPI_THREAD_SERIALIZED (provided=%d)\n", provided);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 
     assert(argc == 9);
     const char* filename = argv[1];
@@ -75,70 +124,106 @@ int main(int argc, char** argv) {
     int width = strtol(argv[7], 0, 10);
     int height = strtol(argv[8], 0, 10);
 
-    struct timespec start_total_time, end_total_time;
-    struct timespec start_calculation_time, end_calculation_time;
-    struct timespec start_write_time, end_write_time;
-
-    clock_gettime(CLOCK_MONOTONIC, &start_total_time);
-
-    int rows_per_proc = height / world_size;
-    int remainder = height % world_size;
-    int my_rows = rows_per_proc + (world_rank < remainder ? 1 : 0);
-
-    int* recvcounts = NULL;
-    int* displs = NULL;
-    if (world_rank == 0) {
-        recvcounts = (int*)malloc(world_size * sizeof(int));
-        displs = (int*)malloc(world_size * sizeof(int));
-        int accumulated_displs = 0;
-        for (int i = 0; i < world_size; ++i) {
-            int r = rows_per_proc + (i < remainder ? 1 : 0);
-            recvcounts[i] = r * width;
-            displs[i] = accumulated_displs;
-            accumulated_displs += recvcounts[i];
-        }
-    }
-
-    int* local_image = (int*)malloc(my_rows * width * sizeof(int));
-    assert(local_image);
+    g_height = height;
+    g_world_size = world_size;
 
     MPI_Barrier(MPI_COMM_WORLD);
-    clock_gettime(CLOCK_MONOTONIC, &start_calculation_time);
+    const double t_total_start = MPI_Wtime();
 
     const double y_diff = (upper - lower) / height;
     const double x_diff = (right - left) / width;
     const __m512d v_four = _mm512_set1_pd(4.0);
 
-    // 針對每個 Thread 進行獨立統計的結構
-    int max_threads = 32; // 預留最大執行緒數空間
-    double thread_calc_time[32] = {0.0};
-    long long thread_rows[32] = {0};
-    int thread_last_cpu[32] = {-1};
+    const int max_threads = omp_get_max_threads();
+    int chunk_size = 2 * max_threads;
+    if (const char* env = getenv("HW2_CHUNK")) {
+        int v = atoi(env);
+        if (v > 0) chunk_size = v;
+    }
+    if (chunk_size < 1) chunk_size = 1;
 
-    /* OpenMP 動態排程平行計算 */
+
+    int* local_image = (int*)malloc((size_t)width * height * sizeof(int));
+    assert(local_image);
+    int* image = (world_rank == 0) ? local_image : NULL;
+
+    double*    t_compute = (double*)calloc(max_threads, sizeof(double));
+    double*    t_idle    = (double*)calloc(max_threads, sizeof(double));
+    double*    t_sched   = (double*)calloc(max_threads, sizeof(double));
+    long long* t_rows    = (long long*)calloc(max_threads, sizeof(long long));
+    int*       t_cpu     = (int*)malloc(max_threads * sizeof(int));
+    long long* t_migr    = (long long*)calloc(max_threads, sizeof(long long));
+    for (int i = 0; i < max_threads; ++i) t_cpu[i] = -1;
+    int actual_threads = 1;
+
+    double region_wall = 0.0;
+
+    int local_next = 0, local_end = 0, rank_done = 0;
+    long long chunks_fetched = 0;
+    std::vector<int> chunk_list;   
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    pthread_t server_tid;
+    bool server_started = false;
+    if (world_rank == 0 && world_size > 1) {
+        pthread_create(&server_tid, NULL, server_main, NULL);
+        server_started = true;
+    }
+
     #pragma omp parallel
     {
-        int tid = omp_get_thread_num();
-        double thread_start_wtime = omp_get_wtime();
+        const int tid = omp_get_thread_num();
+
+        #pragma omp single
+        actual_threads = omp_get_num_threads();
+
+        const double thread_region_start = omp_get_wtime();
         double active_time = 0.0;
+        double sched_time = 0.0;
         long long rows_handled = 0;
-        int current_cpu = -1;
+        long long migrations = 0;
+        int prev_cpu = sched_getcpu();
 
-        #pragma omp for schedule(dynamic, 1)
-        for (int r = 0; r < my_rows; ++r) {
-            double iter_start = omp_get_wtime();
-            current_cpu = sched_getcpu();
-            rows_handled++;
-
-            int j;
-            if (world_rank < remainder) {
-                j = world_rank * (rows_per_proc + 1) + r;
-            } else {
-                j = remainder * (rows_per_proc + 1) + (world_rank - remainder) * rows_per_proc + r;
+        while (true) {
+            const double sched_start = omp_get_wtime();
+            int j = -1;
+            #pragma omp critical(row_sched)
+            {
+                if (local_next >= local_end && !rank_done) {
+                    int s = 0, c = 0;
+                    if (world_rank == 0) {
+                        c = grab_chunk(chunk_size, &s);
+                    } else {
+                        int req = chunk_size;
+                        int resp[2];
+                        MPI_Send(&req, 1, MPI_INT, 0, TAG_REQ, MPI_COMM_WORLD);
+                        MPI_Recv(resp, 2, MPI_INT, 0, TAG_RESP, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                        s = resp[0];
+                        c = resp[1];
+                    }
+                    if (c == 0) {
+                        rank_done = 1;
+                    } else {
+                        local_next = s;
+                        local_end = s + c;
+                        chunks_fetched++;
+                        if (world_rank != 0) { chunk_list.push_back(s); chunk_list.push_back(c); }
+                    }
+                }
+                if (local_next < local_end) j = local_next++;
             }
+            sched_time += omp_get_wtime() - sched_start;
+            if (j < 0) break;
+
+            const double iter_start = omp_get_wtime();
+            int cur_cpu = sched_getcpu();
+            if (cur_cpu != prev_cpu) { migrations++; prev_cpu = cur_cpu; }
+            rows_handled++;
 
             double y0_val = j * y_diff + lower;
             __m512d y0 = _mm512_set1_pd(y0_val);
+            const int row_offset = j * width;
 
             int i = 0;
             for (; i <= width - 32; i += 32) {
@@ -163,10 +248,10 @@ int main(int argc, char** argv) {
                 int iter = 0;
 
                 while (iter < iters) {
-                    __mmask8 mask_A = _mm512_cmp_pd_mask(lsq_A, v_four, _MM_CMPINT_LT);
-                    __mmask8 mask_B = _mm512_cmp_pd_mask(lsq_B, v_four, _MM_CMPINT_LT);
-                    __mmask8 mask_C = _mm512_cmp_pd_mask(lsq_C, v_four, _MM_CMPINT_LT);
-                    __mmask8 mask_D = _mm512_cmp_pd_mask(lsq_D, v_four, _MM_CMPINT_LT);
+                    __mmask8 mask_A = _mm512_cmp_pd_mask(lsq_A, v_four, _CMP_LT_OS);
+                    __mmask8 mask_B = _mm512_cmp_pd_mask(lsq_B, v_four, _CMP_LT_OS);
+                    __mmask8 mask_C = _mm512_cmp_pd_mask(lsq_C, v_four, _CMP_LT_OS);
+                    __mmask8 mask_D = _mm512_cmp_pd_mask(lsq_D, v_four, _CMP_LT_OS);
 
                     if (mask_A == 0 && mask_B == 0 && mask_C == 0 && mask_D == 0) break;
 
@@ -221,7 +306,6 @@ int main(int argc, char** argv) {
                     iter++;
                 }
 
-                int row_offset = r * width;
                 for (int k = 0; k < 8; ++k) {
                     local_image[row_offset + (i + k)] = repeats_A[k];
                     local_image[row_offset + (i + 8 + k)] = repeats_B[k];
@@ -230,7 +314,6 @@ int main(int argc, char** argv) {
                 }
             }
 
-            /* 尾數處理 */
             for (; i <= width - 8; i += 8) {
                 double x0_vals[8];
                 for (int k = 0; k < 8; ++k) x0_vals[k] = (i + k) * x_diff + left;
@@ -239,7 +322,7 @@ int main(int argc, char** argv) {
                 int repeats[8] = {0}, iter = 0;
 
                 while (iter < iters) {
-                    __mmask8 active_mask = _mm512_cmp_pd_mask(length_squared, v_four, _MM_CMPINT_LT);
+                    __mmask8 active_mask = _mm512_cmp_pd_mask(length_squared, v_four, _CMP_LT_OS);
                     if (active_mask == 0) break;
                     for (int k = 0; k < 8; ++k) if ((active_mask >> k) & 1) repeats[k]++;
                     __m512d x2 = _mm512_mul_pd(x, x), y2 = _mm512_mul_pd(y, y), xy = _mm512_mul_pd(x, y);
@@ -250,7 +333,6 @@ int main(int argc, char** argv) {
                     length_squared = _mm512_add_pd(_mm512_mul_pd(x, x), _mm512_mul_pd(y, y));
                     iter++;
                 }
-                int row_offset = r * width;
                 for (int k = 0; k < 8; ++k) local_image[row_offset + (i + k)] = repeats[k];
             }
 
@@ -265,84 +347,155 @@ int main(int argc, char** argv) {
                     length_squared = x * x + y * y;
                     ++repeats;
                 }
-                local_image[r * width + i] = repeats;
+                local_image[row_offset + i] = repeats;
             }
 
             active_time += (omp_get_wtime() - iter_start);
         }
 
-        #pragma omp critical
-        {
-            if (tid < max_threads) {
-                thread_calc_time[tid] = active_time * 1000.0; // 轉為 ms
-                thread_rows[tid] = rows_handled;
-                thread_last_cpu[tid] = current_cpu;
+        t_compute[tid] = active_time;
+        t_sched[tid]   = sched_time;
+        t_rows[tid]    = rows_handled;
+        t_cpu[tid]     = sched_getcpu();
+        t_migr[tid]    = migrations;
+
+        #pragma omp barrier
+        const double thread_region_end = omp_get_wtime();
+
+        t_idle[tid] = (thread_region_end - thread_region_start) - active_time;
+
+        #pragma omp master
+        region_wall = thread_region_end - thread_region_start;
+    }
+
+    const double t_bar_start = MPI_Wtime();
+    if (server_started) pthread_join(server_tid, NULL);
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double barrier_wait = MPI_Wtime() - t_bar_start;
+
+    const double t_gather_start = MPI_Wtime();
+
+    int my_nchunks = (world_rank == 0) ? 0 : (int)(chunk_list.size() / 2);
+    int* all_n = NULL;
+    int* lcounts = NULL;
+    int* ldispls = NULL;
+    int* all_lists = NULL;
+    int total_chunks = 0;
+    if (world_rank == 0) {
+        all_n = (int*)malloc(world_size * sizeof(int));
+        lcounts = (int*)malloc(world_size * sizeof(int));
+        ldispls = (int*)malloc(world_size * sizeof(int));
+    }
+    MPI_Gather(&my_nchunks, 1, MPI_INT, all_n, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    if (world_rank == 0) {
+        for (int i = 0; i < world_size; ++i) {
+            lcounts[i] = all_n[i] * 2;
+            ldispls[i] = total_chunks * 2;
+            total_chunks += all_n[i];
+        }
+        all_lists = (int*)malloc((size_t)(total_chunks > 0 ? total_chunks : 1) * 2 * sizeof(int));
+    }
+    MPI_Gatherv(chunk_list.data(), my_nchunks * 2, MPI_INT,
+                all_lists, lcounts, ldispls, MPI_INT, 0, MPI_COMM_WORLD);
+
+    std::vector<MPI_Request> reqs;
+    if (world_rank == 0) {
+        reqs.reserve(total_chunks);
+        for (int src = 1; src < world_size; ++src) {
+            for (int i = 0; i < all_n[src]; ++i) {
+                int s = all_lists[ldispls[src] + 2 * i];
+                int c = all_lists[ldispls[src] + 2 * i + 1];
+                MPI_Request rq;
+                MPI_Irecv(image + (size_t)s * width, c * width, MPI_INT, src, TAG_DATA, MPI_COMM_WORLD, &rq);
+                reqs.push_back(rq);
             }
         }
+    } else {
+        reqs.reserve(my_nchunks);
+        for (int i = 0; i < my_nchunks; ++i) {
+            int s = chunk_list[2 * i];
+            int c = chunk_list[2 * i + 1];
+            MPI_Request rq;
+            MPI_Isend(local_image + (size_t)s * width, c * width, MPI_INT, 0, TAG_DATA, MPI_COMM_WORLD, &rq);
+            reqs.push_back(rq);
+        }
     }
+    if (!reqs.empty()) MPI_Waitall((int)reqs.size(), reqs.data(), MPI_STATUSES_IGNORE);
 
-    MPI_Barrier(MPI_COMM_WORLD);
-    clock_gettime(CLOCK_MONOTONIC, &end_calculation_time);
+    const double gather_time = MPI_Wtime() - t_gather_start;
 
-    int actual_threads;
-    #pragma omp parallel
-    {
-        #pragma omp single
-        actual_threads = omp_get_num_threads();
-    }
-
-    int* image = NULL;
     if (world_rank == 0) {
-        image = (int*)malloc(width * height * sizeof(int));
-        assert(image);
+        free(all_n); free(lcounts); free(ldispls); free(all_lists);
+    } else {
+        free(local_image);
+        local_image = NULL;
     }
 
-    MPI_Gatherv(local_image, my_rows * width, MPI_INT,
-                image, recvcounts, displs, MPI_INT,
-                0, MPI_COMM_WORLD);
-
-    clock_gettime(CLOCK_MONOTONIC, &end_total_time);
-
-    double write_time = 0.0;
+    double io_time = 0.0;
     if (world_rank == 0) {
-        clock_gettime(CLOCK_MONOTONIC, &start_write_time);
+        const double t_io_start = MPI_Wtime();
         write_png(filename, iters, width, height, image);
-        clock_gettime(CLOCK_MONOTONIC, &end_write_time);
+        io_time = MPI_Wtime() - t_io_start;
         free(image);
-
-        write_time = (end_write_time.tv_sec - start_write_time.tv_sec) +
-                     (end_write_time.tv_nsec - start_write_time.tv_nsec) / 1e9;
     }
 
-    double total_time_ms = (end_total_time.tv_sec - start_total_time.tv_sec) * 1000.0 +
-                           (end_total_time.tv_nsec - start_total_time.tv_nsec) / 1e6;
-    double calc_time_ms = (end_calculation_time.tv_sec - start_calculation_time.tv_sec) * 1000.0 +
-                          (end_calculation_time.tv_nsec - start_calculation_time.tv_nsec) / 1e6;
+    const double t_fw_start = MPI_Wtime();
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double final_wait = MPI_Wtime() - t_fw_start;
 
-    // 印出以 Thread 為單位的精準分析報表
-    printf("========================================================\n");
-    printf("[Rank %d] Thread-Level Performance & Core Analysis\n", world_rank);
-    printf("========================================================\n");
-    printf("Total Execution Time : %.2f ms\n", total_time_ms);
-    printf("Calculation Time     : %.2f ms\n", calc_time_ms);
-    for (int t = 0; t < actual_threads; ++t) {
-        int cpu = thread_last_cpu[t];
-        const char* core_type = (cpu == 0 || cpu == 2 || cpu == 4 || cpu == 6) ? "Big Core" : "Little Core";
-        if (cpu == -1) core_type = "Idle/Unassigned";
+    const double total_time = MPI_Wtime() - t_total_start;
 
-        printf("  -> Thread %d | CPU ID: %2d (%s) | Work: %5lld rows | Active Time: %.2f ms\n",
-               t, cpu, core_type, thread_rows[t], thread_calc_time[t]);
+    double* th_local = (double*)calloc((size_t)max_threads * TH_FIELDS, sizeof(double));
+    for (int t = 0; t < max_threads; ++t) {
+        th_local[t * TH_FIELDS + 0] = (double)t_cpu[t];
+        th_local[t * TH_FIELDS + 1] = (double)t_rows[t];
+        th_local[t * TH_FIELDS + 2] = t_compute[t];
+        th_local[t * TH_FIELDS + 3] = t_idle[t];
+        th_local[t * TH_FIELDS + 4] = (double)t_migr[t];
+        th_local[t * TH_FIELDS + 5] = t_sched[t];
     }
+    double rk_local[RK_FIELDS] = { region_wall, barrier_wait, gather_time, io_time,
+                                   final_wait, total_time, (double)chunks_fetched };
+
+    double* th_all = NULL;
+    double* rk_all = NULL;
     if (world_rank == 0) {
-        printf("I/O (Write) Time     : %.2f ms\n", write_time * 1000.0);
+        th_all = (double*)malloc((size_t)world_size * max_threads * TH_FIELDS * sizeof(double));
+        rk_all = (double*)malloc((size_t)world_size * RK_FIELDS * sizeof(double));
     }
-    printf("========================================================\n");
+    MPI_Gather(th_local, max_threads * TH_FIELDS, MPI_DOUBLE,
+               th_all,   max_threads * TH_FIELDS, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Gather(rk_local, RK_FIELDS, MPI_DOUBLE,
+               rk_all,   RK_FIELDS, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
-    free(local_image);
     if (world_rank == 0) {
-        free(recvcounts);
-        free(displs);
+        printf("CSV_HEADER,procs,threads,rank,tid,cpu,rows,compute_ms,idle_ms,migrations,"
+               "region_ms,barrier_wait_ms,gatherv_ms,io_ms,final_wait_ms,total_ms,sched_ms,chunks\n");
+        for (int rk = 0; rk < world_size; ++rk) {
+            const double* R = rk_all + rk * RK_FIELDS;
+            for (int t = 0; t < actual_threads; ++t) {
+                const double* T = th_all + ((size_t)rk * max_threads + t) * TH_FIELDS;
+                printf("CSV,%d,%d,%d,%d,%d,%lld,%.3f,%.3f,%lld,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%lld\n",
+                       world_size, actual_threads, rk, t,
+                       (int)T[0], (long long)T[1],
+                       T[2] * 1000.0, T[3] * 1000.0, (long long)T[4],
+                       R[0] * 1000.0, R[1] * 1000.0, R[2] * 1000.0,
+                       R[3] * 1000.0, R[4] * 1000.0, R[5] * 1000.0,
+                       T[5] * 1000.0, (long long)R[6]);
+            }
+        }
+        fflush(stdout);
+        free(th_all);
+        free(rk_all);
     }
+
+    free(th_local);
+    free(t_compute);
+    free(t_idle);
+    free(t_sched);
+    free(t_rows);
+    free(t_cpu);
+    free(t_migr);
 
     MPI_Finalize();
     return 0;

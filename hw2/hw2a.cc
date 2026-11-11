@@ -71,7 +71,6 @@ void* mandelbrot_thread(void* arg) {
     const __m512d v_four = _mm512_set1_pd(4.0);
 
     while (1) {
-        /* 1. 動態取得下一行要計算的工作 */
         pthread_mutex_lock(data->row_mutex);
         int j = *(data->global_row);
         (*(data->global_row))++;
@@ -88,36 +87,38 @@ void* mandelbrot_thread(void* arg) {
         double left = data->left;
 
         int i = 0;
-        /* 2. AVX-512 3組交錯迴圈：一次處理 24 個像素 (3個 zmm 寬度) */
-        for (; i <= data->width - 24; i += 24) {
-            double x0_vals_A[8], x0_vals_B[8], x0_vals_C[8];
+        for (; i <= data->width - 32; i += 32) {
+            double x0_vals_A[8], x0_vals_B[8], x0_vals_C[8], x0_vals_D[8];
             for (int k = 0; k < 8; ++k) {
                 x0_vals_A[k] = (i + k) * dx + left;
                 x0_vals_B[k] = (i + 8 + k) * dx + left;
                 x0_vals_C[k] = (i + 16 + k) * dx + left;
+                x0_vals_D[k] = (i + 24 + k) * dx + left;
             }
             __m512d x0_A = _mm512_loadu_pd(x0_vals_A);
             __m512d x0_B = _mm512_loadu_pd(x0_vals_B);
             __m512d x0_C = _mm512_loadu_pd(x0_vals_C);
+            __m512d x0_D = _mm512_loadu_pd(x0_vals_D);
 
             __m512d x_A = _mm512_setzero_pd(), y_A = _mm512_setzero_pd(), lsq_A = _mm512_setzero_pd();
             __m512d x_B = _mm512_setzero_pd(), y_B = _mm512_setzero_pd(), lsq_B = _mm512_setzero_pd();
             __m512d x_C = _mm512_setzero_pd(), y_C = _mm512_setzero_pd(), lsq_C = _mm512_setzero_pd();
+            __m512d x_D = _mm512_setzero_pd(), y_D = _mm512_setzero_pd(), lsq_D = _mm512_setzero_pd();
             
             int repeats_A[8] = {0};
             int repeats_B[8] = {0};
             int repeats_C[8] = {0};
+            int repeats_D[8] = {0};
             int iter = 0;
 
             while (iter < data->iters) {
                 __mmask8 mask_A = _mm512_cmp_pd_mask(lsq_A, v_four, _MM_CMPINT_LT);
                 __mmask8 mask_B = _mm512_cmp_pd_mask(lsq_B, v_four, _MM_CMPINT_LT);
                 __mmask8 mask_C = _mm512_cmp_pd_mask(lsq_C, v_four, _MM_CMPINT_LT);
+                __mmask8 mask_D = _mm512_cmp_pd_mask(lsq_D, v_four, _MM_CMPINT_LT);
                 
-                /* 如果三組都已經全部發散，直接跳出迴圈 */
-                if (mask_A == 0 && mask_B == 0 && mask_C == 0) break;
+                if (mask_A == 0 && mask_B == 0 && mask_C == 0 && mask_D == 0) break;
 
-                /* A 組狀態更新 */
                 if (mask_A != 0) {
                     for (int k = 0; k < 8; ++k) {
                         if ((mask_A >> k) & 1) repeats_A[k]++;
@@ -132,7 +133,6 @@ void* mandelbrot_thread(void* arg) {
                     lsq_A = _mm512_add_pd(_mm512_mul_pd(x_A, x_A), _mm512_mul_pd(y_A, y_A));
                 }
 
-                /* B 組狀態更新 */
                 if (mask_B != 0) {
                     for (int k = 0; k < 8; ++k) {
                         if ((mask_B >> k) & 1) repeats_B[k]++;
@@ -147,7 +147,6 @@ void* mandelbrot_thread(void* arg) {
                     lsq_B = _mm512_add_pd(_mm512_mul_pd(x_B, x_B), _mm512_mul_pd(y_B, y_B));
                 }
 
-                /* C 組狀態更新 */
                 if (mask_C != 0) {
                     for (int k = 0; k < 8; ++k) {
                         if ((mask_C >> k) & 1) repeats_C[k]++;
@@ -162,18 +161,31 @@ void* mandelbrot_thread(void* arg) {
                     lsq_C = _mm512_add_pd(_mm512_mul_pd(x_C, x_C), _mm512_mul_pd(y_C, y_C));
                 }
 
+                if (mask_D != 0) {
+                    for (int k = 0; k < 8; ++k) {
+                        if ((mask_D >> k) & 1) repeats_D[k]++;
+                    }
+                    __m512d x2_D = _mm512_mul_pd(x_D, x_D);
+                    __m512d y2_D = _mm512_mul_pd(y_D, y_D);
+                    __m512d xy_D = _mm512_mul_pd(x_D, y_D);
+                    __m512d temp_D = _mm512_add_pd(_mm512_sub_pd(x2_D, y2_D), x0_D);
+                    __m512d next_y_D = _mm512_add_pd(_mm512_add_pd(xy_D, xy_D), y0);
+                    x_D = _mm512_mask_mov_pd(x_D, mask_D, temp_D);
+                    y_D = _mm512_mask_mov_pd(y_D, mask_D, next_y_D);
+                    lsq_D = _mm512_add_pd(_mm512_mul_pd(x_D, x_D), _mm512_mul_pd(y_D, y_D));
+                }
+
                 iter++;
             }
 
-            /* 寫回 A、B、C 三組結果 */
             for (int k = 0; k < 8; ++k) {
                 data->image[j * data->width + (i + k)] = repeats_A[k];
                 data->image[j * data->width + (i + 8 + k)] = repeats_B[k];
                 data->image[j * data->width + (i + 16 + k)] = repeats_C[k];
+                data->image[j * data->width + (i + 24 + k)] = repeats_D[k];
             }
         }
 
-        /* 3. 中間尾數處理 (處理剩下的 >= 8 且 < 24 個像素) */
         for (; i <= data->width - 8; i += 8) {
             double x0_vals[8];
             for (int k = 0; k < 8; ++k) {
@@ -207,7 +219,6 @@ void* mandelbrot_thread(void* arg) {
             }
         }
 
-        /* 4. 純量尾數補齊 (Tail Handling) */
         for (; i < data->width; ++i) {
             double x0 = i * dx + left;
             int repeats = 0;
@@ -227,7 +238,6 @@ void* mandelbrot_thread(void* arg) {
 }
 
 int main(int argc, char** argv) {
-    /* detect how many CPUs are available */
     cpu_set_t cpu_set;
     sched_getaffinity(0, sizeof(cpu_set), &cpu_set);
     printf("%d cpus available\n", CPU_COUNT(&cpu_set));
@@ -256,14 +266,12 @@ int main(int argc, char** argv) {
     struct timespec start_calculation_time, end_calculation_time;
     struct timespec start_write_time, end_write_time;
 
-    /* allocate memory for image */
     int* image = (int*)malloc(width * height * sizeof(int));
     assert(image);
 
     pthread_t *threads = (pthread_t *)malloc(num_threads * sizeof(pthread_t));
     thread_data_t *thread_data = (thread_data_t *)malloc(num_threads * sizeof(thread_data_t));
 
-    /* 初始化動態排程的全域變數與 Mutex */
     int global_row = 0;
     pthread_mutex_t row_mutex;
     pthread_mutex_init(&row_mutex, NULL);
@@ -292,12 +300,10 @@ int main(int argc, char** argv) {
     }
     clock_gettime(CLOCK_MONOTONIC, &end_calculation_time);
 
-    /* 銷毀 Mutex 與釋放動態記憶體 */
     pthread_mutex_destroy(&row_mutex);
     free(threads);
     free(thread_data);
 
-    /* draw and cleanup */
     clock_gettime(CLOCK_MONOTONIC, &start_write_time);
     write_png(filename, iters, width, height, image);
     free(image);
