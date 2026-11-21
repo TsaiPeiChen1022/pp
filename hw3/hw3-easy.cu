@@ -19,157 +19,256 @@ struct Edge {
 
 // TODO: add kernels: init distances, relax frontier edges (atomicMin / atomicAdd), find next bucket
 
-// 1. 初始化距離、旗標，並將起點 src 放入初始 pending 佇列
-__global__ void init_kernel(int* dist, int* flags, int* init_pend, int* d_pend_cnt, int n, int src) {
-    int v = blockIdx.x * blockDim.x + threadIdx.x;
-    if (v >= n) return;
+// [新增 Block-per-Source] 每個 Block 獨立負責多個起點（動態搶號），完整跑完單一 src 的 Delta-Stepping
+// T: 每個 Block 的執行緒數；G: 幾個執行緒一組（sub-warp）共同走訪同一個頂點的鄰接邊
+template <int T, int G>
+__global__ void __launch_bounds__(T)
+apsp_block_per_src_kernel(const int* __restrict__ light_row_ptr,
+                          const Edge* __restrict__ light_adj,
+                          const int* __restrict__ heavy_row_ptr,
+                          const Edge* __restrict__ heavy_adj,
+                          int n, int delta,
+                          int src_base, int src_count,
+                          int* __restrict__ d_out_dist,
+                          int* __restrict__ d_block_state,
+                          int* __restrict__ d_src_counter) {
+    static_assert(T % G == 0, "Block threads T must be divisible by group size G");
 
-    flags[v] = 0;
-    if (v == src) {
-        dist[v] = 0;
-        flags[v] = FLAG_IN_PEND;
-        int idx = atomicAdd(d_pend_cnt, 1);
-        init_pend[idx] = v;
-    } else {
-        dist[v] = INF;
-    }
-}
+    // 區塊內共用控制變數（全部放在 Shared Memory，避免迴圈內頻繁回 Host 同步）
+    __shared__ int s_sidx;
+    __shared__ int s_min_b;
+    __shared__ int s_cb;
+    __shared__ int s_pend_cnt;
+    __shared__ int s_next_pend_cnt;
+    __shared__ int s_cur_cnt;
+    __shared__ int s_nxt_cnt;
+    __shared__ int s_R_cnt;
 
-// 2. 清除本桶子殘留的 FLAG_IN_BUCKET_DONE 旗標
-__global__ void clear_bucket_done_flag_kernel(int* flags, int n) {
-    int v = blockIdx.x * blockDim.x + threadIdx.x;
-    if (v >= n) return;
-    atomicAnd(&flags[v], ~FLAG_IN_BUCKET_DONE);
-}
+    const int tid = threadIdx.x;
+    const int grp = tid / G;
+    const int lane = tid % G;
+    constexpr int ngrp = T / G;
 
-// 3. 找出目前 pending 集合中、桶子編號 > current_bucket 的最小桶子編號
-__global__ void find_next_bucket_kernel(const int* dist, const int* pend_verts, int pend_size,
-                                       int delta, int current_bucket, int* d_min_b) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= pend_size) return;
+    // 每個 Block 獨佔 6 * n 個 int 的工作區：
+    // [0..n-1] flags, [n..2n-1] pendA, [2n..3n-1] pendB, [3n..4n-1] cur, [4n..5n-1] nxt, [5n..6n-1] R
+    int* base      = d_block_state + (size_t)blockIdx.x * 6ULL * (size_t)n;
+    int* flags     = base;
+    int* pendA     = base + (size_t)n;
+    int* pendB     = base + 2ULL * (size_t)n;
+    int* cur       = base + 3ULL * (size_t)n;
+    int* nxt       = base + 4ULL * (size_t)n;
+    int* R         = base + 5ULL * (size_t)n;
 
-    int v = pend_verts[i];
-    int dv = dist[v];
-    if (dv >= INF) return;
-
-    int b = dv / delta;
-    if (b > current_bucket) {
-        atomicMin(d_min_b, b);
-    }
-}
-
-// 4. 在 GPU 上將 pending 頂點分派至：
-//    - light_frontier 與 bucket_done（屬於 target_bucket）
-//    - next_pend（屬於更大的 bucket，留到未來）
-//    並正確更新 FLAG_IN_PEND / FLAG_IN_BUCKET_DONE
-__global__ void partition_pending_kernel(const int* dist, const int* pending, int pending_size,
-                                       int delta, int current_bucket, int target_bucket,
-                                       int* flags,
-                                       int* out_light_frontier, int* d_light_cnt,
-                                       int* out_bucket_done, int* d_bucket_done_cnt,
-                                       int* out_next_pend, int* d_next_pend_cnt) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= pending_size) return;
-
-    int v = pending[i];
-    // 離開目前 pending 佇列，先清除 FLAG_IN_PEND
-    atomicAnd(&flags[v], ~FLAG_IN_PEND);
-
-    int dv = dist[v];
-    if (dv >= INF) return;
-
-    int b = dv / delta;
-    if (b <= current_bucket) {
-        return;
-    } else if (b == target_bucket) {
-        out_light_frontier[atomicAdd(d_light_cnt, 1)] = v;
-        if ((atomicOr(&flags[v], FLAG_IN_BUCKET_DONE) & FLAG_IN_BUCKET_DONE) == 0) {
-            out_bucket_done[atomicAdd(d_bucket_done_cnt, 1)] = v;
+    while (true) {
+        if (tid == 0) {
+            s_sidx = atomicAdd(d_src_counter, 1);
         }
-    } else {
-        if ((atomicOr(&flags[v], FLAG_IN_PEND) & FLAG_IN_PEND) == 0) {
-            out_next_pend[atomicAdd(d_next_pend_cnt, 1)] = v;
+        __syncthreads();
+
+        const int sidx = s_sidx;
+        if (sidx >= src_count) break;
+
+        const int src = src_base + sidx;
+        int* dist = d_out_dist + (size_t)sidx * (size_t)n;
+
+        // 初始化此 src 的距離與旗標
+        for (int v = tid; v < n; v += T) {
+            if (v == src) {
+                dist[v] = 0;
+                flags[v] = FLAG_IN_PEND;
+            } else {
+                dist[v] = INF;
+                flags[v] = 0;
+            }
         }
-    }
-}
 
-// 5. Phase 1 每一輪結束後，直接在 GPU 將 next_light_frontier 推進為下一輪 light_frontier、
-//    併入 bucket_done（去重），並清除 FLAG_IN_NEXT_LIGHT
-__global__ void promote_next_light_kernel(const int* next_light, int next_light_size,
-                                          int* out_light_frontier,
-                                          int* bucket_done, int* d_bucket_done_cnt,
-                                          int* flags) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= next_light_size) return;
+        if (tid == 0) {
+            pendA[0] = src;
+            s_pend_cnt = 1;
+            s_next_pend_cnt = 0;
+            s_cur_cnt = 0;
+            s_nxt_cnt = 0;
+            s_R_cnt = 0;
+            s_cb = -1;
+        }
+        __syncthreads();
 
-    int v = next_light[i];
-    out_light_frontier[i] = v;
-    atomicAnd(&flags[v], ~FLAG_IN_NEXT_LIGHT);
+        int* pend = pendA;
+        int* next_pend = pendB;
 
-    if ((atomicOr(&flags[v], FLAG_IN_BUCKET_DONE) & FLAG_IN_BUCKET_DONE) == 0) {
-        bucket_done[atomicAdd(d_bucket_done_cnt, 1)] = v;
-    }
-}
+        while (true) {
+            // 1. 尋找目前 pending 中、桶號 > s_cb 的最小桶號
+            if (tid == 0) {
+                s_min_b = INT_MAX;
+                s_R_cnt = 0;
+                s_cur_cnt = 0;
+                s_next_pend_cnt = 0;
+            }
+            __syncthreads();
 
-// 6a. [新增拆函式] Phase 1 專用：鬆弛輕邊 CSR，同桶內（nd < bound）進 next_light，超出桶界進 pend
-__global__ void relax_light_kernel(const int* row_ptr, const Edge* adj,
-                                   const int* verts, int verts_size, int bound,
-                                   int* dist, int* flags,
-                                   int* out_next_light, int* d_next_light_cnt,
-                                   int* out_pend, int* d_pend_cnt) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= verts_size) return;
+            const int pc = s_pend_cnt;
+            const int cb = s_cb;
 
-    int v = verts[idx];
-    int dv = dist[v];
-    if (dv >= INF) return;
-
-    for (int e = row_ptr[v]; e < row_ptr[v + 1]; ++e) {
-        int u = adj[e].to;
-        int nd = dv + adj[e].w;
-        if (nd < dist[u]) {
-            int old = atomicMin(&dist[u], nd);
-            if (nd < old) {
-                if (nd < bound) {
-                    if ((atomicOr(&flags[u], FLAG_IN_NEXT_LIGHT) & FLAG_IN_NEXT_LIGHT) == 0) {
-                        int pos = atomicAdd(d_next_light_cnt, 1);
-                        out_next_light[pos] = u;
-                    }
-                } else {
-                    if ((atomicOr(&flags[u], FLAG_IN_PEND) & FLAG_IN_PEND) == 0) {
-                        int pos = atomicAdd(d_pend_cnt, 1);
-                        out_pend[pos] = u;
+            for (int i = tid; i < pc; i += T) {
+                int v = pend[i];
+                int dv = dist[v];
+                if (dv < INF) {
+                    int b = dv / delta;
+                    if (b > cb) {
+                        atomicMin(&s_min_b, b);
                     }
                 }
             }
-        }
-    }
-}
+            __syncthreads();
 
-// 6b. [新增拆函式] Phase 2 專用：鬆弛重邊 CSR，更新後直接放入 pend 等待後續 bucket 處理
-__global__ void relax_heavy_kernel(const int* row_ptr, const Edge* adj,
-                                   const int* verts, int verts_size,
-                                   int* dist, int* flags,
-                                   int* out_pend, int* d_pend_cnt) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= verts_size) return;
+            const int min_b = s_min_b;
+            if (min_b == INT_MAX) {
+                // 清理殘留 FLAG_IN_PEND 後結束此 src
+                for (int i = tid; i < pc; i += T) {
+                    atomicAnd(&flags[pend[i]], ~FLAG_IN_PEND);
+                }
+                __syncthreads();
+                break;
+            }
 
-    int v = verts[idx];
-    int dv = dist[v];
-    if (dv >= INF) return;
-
-    for (int e = row_ptr[v]; e < row_ptr[v + 1]; ++e) {
-        int u = adj[e].to;
-        int nd = dv + adj[e].w;
-        if (nd < dist[u]) {
-            int old = atomicMin(&dist[u], nd);
-            if (nd < old) {
-                if ((atomicOr(&flags[u], FLAG_IN_PEND) & FLAG_IN_PEND) == 0) {
-                    int pos = atomicAdd(d_pend_cnt, 1);
-                    out_pend[pos] = u;
+            // 2. 分派 pending 頂點：屬於 min_b 進入 cur 與 R；大於 min_b 留到 next_pend
+            for (int i = tid; i < pc; i += T) {
+                int v = pend[i];
+                atomicAnd(&flags[v], ~FLAG_IN_PEND);
+                int dv = dist[v];
+                if (dv < INF) {
+                    int b = dv / delta;
+                    if (b == min_b) {
+                        int cpos = atomicAdd(&s_cur_cnt, 1);
+                        cur[cpos] = v;
+                        if ((atomicOr(&flags[v], FLAG_IN_BUCKET_DONE) & FLAG_IN_BUCKET_DONE) == 0) {
+                            int rpos = atomicAdd(&s_R_cnt, 1);
+                            R[rpos] = v;
+                        }
+                    } else if (b > min_b) {
+                        if ((atomicOr(&flags[v], FLAG_IN_PEND) & FLAG_IN_PEND) == 0) {
+                            int ppos = atomicAdd(&s_next_pend_cnt, 1);
+                            next_pend[ppos] = v;
+                        }
+                    }
                 }
             }
+            __syncthreads();
+
+            if (tid == 0) {
+                s_pend_cnt = s_next_pend_cnt;
+                s_cb = min_b;
+                s_nxt_cnt = 0;
+            }
+            {
+                int* tmp = pend;
+                pend = next_pend;
+                next_pend = tmp;
+            }
+            __syncthreads();
+
+            const long long bound = (long long)(min_b + 1) * (long long)delta;
+
+            // 3. Phase 1：同桶內輕邊閉包迭代（由 G 個 thread 協作掃描單一頂點的輕邊）
+            while (s_cur_cnt > 0) {
+                const int cc = s_cur_cnt;
+                for (int i = grp; i < cc; i += ngrp) {
+                    int v = cur[i];
+                    int dv = dist[v];
+                    if (dv >= INF) continue;
+
+                    int e_begin = light_row_ptr[v];
+                    int e_end = light_row_ptr[v + 1];
+                    for (int e = e_begin + lane; e < e_end; e += G) {
+                        Edge edge = light_adj[e];
+                        long long nd_ll = (long long)dv + (long long)edge.w;
+                        if (nd_ll >= INF) continue;
+                        int nd = (int)nd_ll;
+                        int u = edge.to;
+
+                        if (nd < dist[u]) {
+                            int old = atomicMin(&dist[u], nd);
+                            if (nd < old) {
+                                if ((long long)nd < bound) {
+                                    if ((flags[u] & FLAG_IN_NEXT_LIGHT) == 0) {
+                                        if ((atomicOr(&flags[u], FLAG_IN_NEXT_LIGHT) & FLAG_IN_NEXT_LIGHT) == 0) {
+                                            int pos = atomicAdd(&s_nxt_cnt, 1);
+                                            nxt[pos] = u;
+                                        }
+                                    }
+                                } else {
+                                    if ((flags[u] & FLAG_IN_PEND) == 0) {
+                                        if ((atomicOr(&flags[u], FLAG_IN_PEND) & FLAG_IN_PEND) == 0) {
+                                            int pos = atomicAdd(&s_pend_cnt, 1);
+                                            pend[pos] = u;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+
+                // 將 nxt 推進為下一輪 cur，並去重併入 R
+                const int nn = s_nxt_cnt;
+                for (int i = tid; i < nn; i += T) {
+                    int v = nxt[i];
+                    cur[i] = v;
+                    atomicAnd(&flags[v], ~FLAG_IN_NEXT_LIGHT);
+                    if ((atomicOr(&flags[v], FLAG_IN_BUCKET_DONE) & FLAG_IN_BUCKET_DONE) == 0) {
+                        int rpos = atomicAdd(&s_R_cnt, 1);
+                        R[rpos] = v;
+                    }
+                }
+                __syncthreads();
+
+                if (tid == 0) {
+                    s_cur_cnt = nn;
+                    s_nxt_cnt = 0;
+                }
+                __syncthreads();
+            }
+
+            // 4. Phase 2：對本桶所有累積頂點 R 鬆弛重邊
+            const int rc = s_R_cnt;
+            if (rc > 0) {
+                for (int i = grp; i < rc; i += ngrp) {
+                    int v = R[i];
+                    int dv = dist[v];
+                    if (dv >= INF) continue;
+
+                    int e_begin = heavy_row_ptr[v];
+                    int e_end = heavy_row_ptr[v + 1];
+                    for (int e = e_begin + lane; e < e_end; e += G) {
+                        Edge edge = heavy_adj[e];
+                        long long nd_ll = (long long)dv + (long long)edge.w;
+                        if (nd_ll >= INF) continue;
+                        int nd = (int)nd_ll;
+                        int u = edge.to;
+
+                        if (nd < dist[u]) {
+                            int old = atomicMin(&dist[u], nd);
+                            if (nd < old) {
+                                if ((flags[u] & FLAG_IN_PEND) == 0) {
+                                    if ((atomicOr(&flags[u], FLAG_IN_PEND) & FLAG_IN_PEND) == 0) {
+                                        int pos = atomicAdd(&s_pend_cnt, 1);
+                                        pend[pos] = u;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+
+                for (int i = tid; i < rc; i += T) {
+                    atomicAnd(&flags[R[i]], ~FLAG_IN_BUCKET_DONE);
+                }
+                __syncthreads();
+            }
         }
+        __syncthreads();
     }
 }
 
@@ -241,49 +340,16 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    const int TPB = 256;
-    const int v_blocks = std::max(1, (n + TPB - 1) / TPB);
-
     // TODO: cudaMalloc device arrays, cudaMemcpy graph to device
-    // ---- Host 端輸出緩衝區 ----
-    std::vector<int> host_dist(std::max(n, 1));
-
-    // ---- Device 端輕／重邊 CSR 與狀態陣列宣告 ----
+    // ---- Device 端共用輕／重邊 CSR 宣告與配置 ----
     int *d_light_row_ptr = nullptr, *d_heavy_row_ptr = nullptr;
     Edge *d_light_adj = nullptr, *d_heavy_adj = nullptr;
-    int *d_dist = nullptr;
-    int *d_flags = nullptr;
 
-    int *d_pend_bufA = nullptr;
-    int *d_pend_bufB = nullptr;
-    int *d_light_frontier = nullptr;
-    int *d_next_light_frontier = nullptr;
-    int *d_bucket_done = nullptr;
-
-    // d_cnts:
-    // [0] = min_b
-    // [1] = light_cnt
-    // [2] = next_light_cnt
-    // [3] = pend_cnt
-    // [4] = bucket_done_cnt
-    // [5] = next_pend_cnt
-    int *d_cnts = nullptr;
-
-    // ---- 配置 Device 記憶體 ----
     cudaMalloc(&d_light_row_ptr, (size_t)(n + 1) * sizeof(int));
     cudaMalloc(&d_heavy_row_ptr, (size_t)(n + 1) * sizeof(int));
     cudaMalloc(&d_light_adj, (size_t)std::max(light_m, 1) * sizeof(Edge));
     cudaMalloc(&d_heavy_adj, (size_t)std::max(heavy_m, 1) * sizeof(Edge));
-    cudaMalloc(&d_dist, (size_t)std::max(n, 1) * sizeof(int));
-    cudaMalloc(&d_flags, (size_t)std::max(n, 1) * sizeof(int));
-    cudaMalloc(&d_pend_bufA, (size_t)std::max(n, 1) * sizeof(int));
-    cudaMalloc(&d_pend_bufB, (size_t)std::max(n, 1) * sizeof(int));
-    cudaMalloc(&d_light_frontier, (size_t)std::max(n, 1) * sizeof(int));
-    cudaMalloc(&d_next_light_frontier, (size_t)std::max(n, 1) * sizeof(int));
-    cudaMalloc(&d_bucket_done, (size_t)std::max(n, 1) * sizeof(int));
-    cudaMalloc(&d_cnts, 6 * sizeof(int));
 
-    // ---- 將輕／重邊 CSR 資料從 Host 搬到 Device ----
     cudaMemcpy(d_light_row_ptr, light_row_ptr.data(), (size_t)(n + 1) * sizeof(int), cudaMemcpyHostToDevice);
     cudaMemcpy(d_heavy_row_ptr, heavy_row_ptr.data(), (size_t)(n + 1) * sizeof(int), cudaMemcpyHostToDevice);
     if (light_m > 0) {
@@ -293,112 +359,64 @@ int main(int argc, char* argv[]) {
         cudaMemcpy(d_heavy_adj, heavy_adj.data(), (size_t)heavy_m * sizeof(Edge), cudaMemcpyHostToDevice);
     }
 
+    // [新增 Block-per-Source] 依可用顯存決定每批處理的起點數與常駐 Block 數
+    constexpr int TPB = 256;
+    constexpr int GRP = 4;
+
+    size_t free_bytes = 0, total_bytes = 0;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+
+    // 每個起點輸出 n 個 int，每個常駐 Block 佔用 6 * n 個 int
+    const size_t per_src_bytes = std::max((size_t)1, (size_t)n * sizeof(int));
+    const size_t per_block_state_bytes = std::max((size_t)1, (size_t)6 * (size_t)n * sizeof(int));
+    const size_t usable_bytes = (free_bytes > (64ULL << 20)) ? (free_bytes - (64ULL << 20)) : (free_bytes / 2);
+
+    int num_blocks = std::max(1, std::min(n > 0 ? n : 1, prop.multiProcessorCount * 4));
+    while (num_blocks > 1 && (size_t)num_blocks * per_block_state_bytes > usable_bytes / 2) {
+        num_blocks /= 2;
+    }
+
+    size_t rem_for_out = (usable_bytes > (size_t)num_blocks * per_block_state_bytes)
+                             ? (usable_bytes - (size_t)num_blocks * per_block_state_bytes)
+                             : per_src_bytes;
+    int batch_size = (n > 0) ? (int)std::max((size_t)1, std::min((size_t)n, rem_for_out / per_src_bytes)) : 0;
+
+    int* d_out_dist = nullptr;
+    int* d_block_state = nullptr;
+    int* d_src_counter = nullptr;
+
+    cudaMalloc(&d_out_dist, (size_t)std::max(batch_size, 1) * (size_t)std::max(n, 1) * sizeof(int));
+    cudaMalloc(&d_block_state, (size_t)num_blocks * (size_t)6 * (size_t)std::max(n, 1) * sizeof(int));
+    cudaMalloc(&d_src_counter, sizeof(int));
+
+    std::vector<int> host_batch_dist((size_t)std::max(batch_size, 1) * (size_t)std::max(n, 1));
+
     FILE* fout = fopen(argv[2], "wb");
     if (!fout) { perror("open output"); return 1; }
 
-    // TODO: replace with flat frontier array + counter
+    // TODO: replace whole loop with kernel launches
+    // [新增 Block-per-Source] 分批啟動常駐 Block 搶算起點，批次完成後一次搬回 Host 寫檔
+    for (int src_base = 0; src_base < n; src_base += batch_size) {
+        const int cur_batch_count = std::min(batch_size, n - src_base);
+        const int cur_blocks = std::min(num_blocks, cur_batch_count);
 
-    for (int src = 0; src < n; ++src) {
-        // TODO: replace with init kernel launch
-        cudaMemset(d_cnts + 3, 0, sizeof(int));
-        init_kernel<<<v_blocks, TPB>>>(d_dist, d_flags, d_pend_bufA, d_cnts + 3, n, src);
-
-        int* d_pend = d_pend_bufA;
-        int* d_next_pend = d_pend_bufB;
-        int pend_cnt = 1;
-        int current_bucket = -1;
-
-        // TODO: replace whole loop with kernel launches
-        while (true) {
-            int init_min_bucket = INT_MAX;
-            cudaMemcpy(d_cnts + 0, &init_min_bucket, sizeof(int), cudaMemcpyHostToDevice);
-
-            if (pend_cnt > 0) {
-                int p_blocks = (pend_cnt + TPB - 1) / TPB;
-                find_next_bucket_kernel<<<p_blocks, TPB>>>(
-                    d_dist, d_pend, pend_cnt, delta, current_bucket, d_cnts + 0
-                );
-            }
-
-            int next_bucket = INT_MAX;
-            cudaMemcpy(&next_bucket, d_cnts + 0, sizeof(int), cudaMemcpyDeviceToHost);
-            if (next_bucket == INT_MAX) break;
-
-            clear_bucket_done_flag_kernel<<<v_blocks, TPB>>>(d_flags, n);
-
-            int zero = 0;
-            cudaMemcpy(d_cnts + 1, &zero, sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_cnts + 4, &zero, sizeof(int), cudaMemcpyHostToDevice);
-            cudaMemcpy(d_cnts + 5, &zero, sizeof(int), cudaMemcpyHostToDevice);
-
-            if (pend_cnt > 0) {
-                int p_blocks = (pend_cnt + TPB - 1) / TPB;
-                partition_pending_kernel<<<p_blocks, TPB>>>(
-                    d_dist, d_pend, pend_cnt, delta, current_bucket, next_bucket,
-                    d_flags,
-                    d_light_frontier, d_cnts + 1,
-                    d_bucket_done, d_cnts + 4,
-                    d_next_pend, d_cnts + 5
-                );
-            }
-
-            int light_cnt = 0;
-            int bucket_done_cnt = 0;
-            int next_pend_cnt = 0;
-            cudaMemcpy(&light_cnt, d_cnts + 1, sizeof(int), cudaMemcpyDeviceToHost);
-            cudaMemcpy(&bucket_done_cnt, d_cnts + 4, sizeof(int), cudaMemcpyDeviceToHost);
-            cudaMemcpy(&next_pend_cnt, d_cnts + 5, sizeof(int), cudaMemcpyDeviceToHost);
-
-            pend_cnt = next_pend_cnt;
-            cudaMemcpy(d_cnts + 3, &pend_cnt, sizeof(int), cudaMemcpyHostToDevice);
-
-            std::swap(d_pend, d_next_pend);
-            current_bucket = next_bucket;
-            int bucket_upper_bound = (next_bucket + 1) * delta;
-
-            // Phase 1: 同桶內輕邊閉包迭代（[修改] 呼叫專用 relax_light_kernel）
-            while (light_cnt > 0) {
-                cudaMemset(d_cnts + 2, 0, sizeof(int));
-                int l_blocks = (light_cnt + TPB - 1) / TPB;
-                relax_light_kernel<<<l_blocks, TPB>>>(
-                    d_light_row_ptr, d_light_adj, d_light_frontier, light_cnt, bucket_upper_bound,
-                    d_dist, d_flags,
-                    d_next_light_frontier, d_cnts + 2, d_pend, d_cnts + 3
-                );
-
-                int next_light_cnt = 0;
-                cudaMemcpy(&next_light_cnt, d_cnts + 2, sizeof(int), cudaMemcpyDeviceToHost);
-                cudaMemcpy(&pend_cnt, d_cnts + 3, sizeof(int), cudaMemcpyDeviceToHost);
-
-                if (next_light_cnt > 0) {
-                    int nl_blocks = (next_light_cnt + TPB - 1) / TPB;
-                    promote_next_light_kernel<<<nl_blocks, TPB>>>(
-                        d_next_light_frontier, next_light_cnt,
-                        d_light_frontier, d_bucket_done, d_cnts + 4, d_flags
-                    );
-                    cudaMemcpy(&bucket_done_cnt, d_cnts + 4, sizeof(int), cudaMemcpyDeviceToHost);
-                }
-                light_cnt = next_light_cnt;
-            }
-
-            // Phase 2: 對本桶子累積的所有頂點做重邊鬆弛（[修改] 呼叫專用 relax_heavy_kernel）
-            if (bucket_done_cnt > 0 && heavy_m > 0) {
-                int bd_blocks = (bucket_done_cnt + TPB - 1) / TPB;
-                relax_heavy_kernel<<<bd_blocks, TPB>>>(
-                    d_heavy_row_ptr, d_heavy_adj, d_bucket_done, bucket_done_cnt,
-                    d_dist, d_flags, d_pend, d_cnts + 3
-                );
-                cudaMemcpy(&pend_cnt, d_cnts + 3, sizeof(int), cudaMemcpyDeviceToHost);
-            }
-        }
-
+        cudaMemset(d_src_counter, 0, sizeof(int));
+        apsp_block_per_src_kernel<TPB, GRP><<<cur_blocks, TPB>>>(
+            d_light_row_ptr, d_light_adj,
+            d_heavy_row_ptr, d_heavy_adj,
+            n, delta,
+            src_base, cur_batch_count,
+            d_out_dist, d_block_state, d_src_counter
+        );
         cudaDeviceSynchronize();
 
         // TODO: cudaMemcpy distances back to host
-        cudaMemcpy(host_dist.data(), d_dist, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost);
+        const size_t batch_elems = (size_t)cur_batch_count * (size_t)n;
+        cudaMemcpy(host_batch_dist.data(), d_out_dist, batch_elems * sizeof(int), cudaMemcpyDeviceToHost);
 
-        if (fwrite(host_dist.data(), sizeof(int), n, fout) != (size_t)n) {
+        if (fwrite(host_batch_dist.data(), sizeof(int), batch_elems, fout) != batch_elems) {
             perror("write output");
+            fclose(fout);
             return 1;
         }
     }
@@ -406,18 +424,13 @@ int main(int argc, char* argv[]) {
 
     // TODO: cudaFree device arrays
     // ---- 釋放 Device 記憶體 ----
+    cudaFree(d_out_dist);
+    cudaFree(d_block_state);
+    cudaFree(d_src_counter);
     cudaFree(d_light_row_ptr);
     cudaFree(d_heavy_row_ptr);
     cudaFree(d_light_adj);
     cudaFree(d_heavy_adj);
-    cudaFree(d_dist);
-    cudaFree(d_flags);
-    cudaFree(d_pend_bufA);
-    cudaFree(d_pend_bufB);
-    cudaFree(d_light_frontier);
-    cudaFree(d_next_light_frontier);
-    cudaFree(d_bucket_done);
-    cudaFree(d_cnts);
 
     return 0;
 }
