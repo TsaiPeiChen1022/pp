@@ -111,10 +111,11 @@ __global__ void promote_next_light_kernel(const int* next_light, int next_light_
     }
 }
 
-// 6. 鬆弛邊（輕邊或重邊），並以 atomicMin 更新距離、atomicAdd 收集下一批頂點
-__global__ void relax_kernel(const int* row_ptr, const Edge* adj, int delta,
+// 6. [新增優化] 針對已分離的單一類別 CSR（輕邊或重邊）做鬆弛，
+//    省去逐條邊判斷 w <= delta 與跳過非目標邊的分支開銷
+__global__ void relax_kernel(const int* row_ptr, const Edge* adj,
                              const int* verts, int verts_size, int bound,
-                             bool is_light, bool to_next_light,
+                             bool to_next_light,
                              int* dist, int* flags,
                              int* out_next_light, int* d_next_light_cnt,
                              int* out_pend, int* d_pend_cnt) {
@@ -126,16 +127,12 @@ __global__ void relax_kernel(const int* row_ptr, const Edge* adj, int delta,
     if (dv >= INF) return;
 
     for (int e = row_ptr[v]; e < row_ptr[v + 1]; ++e) {
-        int w = adj[e].w;
-        bool edge_light = (w <= delta);
-        if (edge_light != is_light) continue;
-
         int u = adj[e].to;
-        int nd = dv + w;
+        int nd = dv + adj[e].w;
         if (nd < dist[u]) {
             int old = atomicMin(&dist[u], nd);
             if (nd < old) {
-                if (is_light && to_next_light && nd < bound) {
+                if (to_next_light && nd < bound) {
                     if ((atomicOr(&flags[u], FLAG_IN_NEXT_LIGHT) & FLAG_IN_NEXT_LIGHT) == 0) {
                         int pos = atomicAdd(d_next_light_cnt, 1);
                         out_next_light[pos] = u;
@@ -177,18 +174,6 @@ int main(int argc, char* argv[]) {
     }
     fclose(fin);
 
-    // Build CSR: out-edges of v are adj[row_ptr[v] .. row_ptr[v+1])
-    std::vector<int> row_ptr(n + 1, 0);
-    for (int i = 0; i < m; ++i) row_ptr[raw[3 * i] + 1]++;
-    for (int v = 0; v < n; ++v) row_ptr[v + 1] += row_ptr[v];
-
-    std::vector<Edge> adj(std::max(m, 1));
-    std::vector<int> next(row_ptr.begin(), row_ptr.end() - 1);
-    for (int i = 0; i < m; ++i) {
-        const int src = raw[3 * i];
-        adj[next[src]++] = Edge{raw[3 * i + 1], raw[3 * i + 2]};
-    }
-
     // Bucket width: same default as hw3-1.cu
     long long wsum = 0;
     for (int i = 0; i < m; ++i) wsum += raw[3 * i + 2];
@@ -197,6 +182,40 @@ int main(int argc, char* argv[]) {
     int delta = std::max(1, (int)(avg_w * 32.0 / avg_deg));
     if (const char* s = getenv("HW3_DELTA")) delta = std::max(1, atoi(s));
 
+    // [新增優化] 建立兩份 CSR：輕邊（w <= delta）與重邊（w > delta）分開存放
+    std::vector<int> light_row_ptr(n + 1, 0), heavy_row_ptr(n + 1, 0);
+    for (int i = 0; i < m; ++i) {
+        const int src = raw[3 * i];
+        const int w = raw[3 * i + 2];
+        if (w <= delta) {
+            light_row_ptr[src + 1]++;
+        } else {
+            heavy_row_ptr[src + 1]++;
+        }
+    }
+    for (int v = 0; v < n; ++v) {
+        light_row_ptr[v + 1] += light_row_ptr[v];
+        heavy_row_ptr[v + 1] += heavy_row_ptr[v];
+    }
+
+    const int light_m = light_row_ptr[n];
+    const int heavy_m = heavy_row_ptr[n];
+    std::vector<Edge> light_adj(std::max(light_m, 1));
+    std::vector<Edge> heavy_adj(std::max(heavy_m, 1));
+    std::vector<int> light_next(light_row_ptr.begin(), light_row_ptr.end() - 1);
+    std::vector<int> heavy_next(heavy_row_ptr.begin(), heavy_row_ptr.end() - 1);
+
+    for (int i = 0; i < m; ++i) {
+        const int src = raw[3 * i];
+        const int dst = raw[3 * i + 1];
+        const int w = raw[3 * i + 2];
+        if (w <= delta) {
+            light_adj[light_next[src]++] = Edge{dst, w};
+        } else {
+            heavy_adj[heavy_next[src]++] = Edge{dst, w};
+        }
+    }
+
     const int TPB = 256;
     const int v_blocks = std::max(1, (n + TPB - 1) / TPB);
 
@@ -204,9 +223,10 @@ int main(int argc, char* argv[]) {
     // ---- Host 端輸出緩衝區 ----
     std::vector<int> host_dist(std::max(n, 1));
 
-    // ---- Device 端圖結構與狀態陣列宣告 ----
-    int *d_row_ptr = nullptr;
-    Edge *d_adj = nullptr;
+    // ---- Device 端輕／重邊 CSR 與狀態陣列宣告 ----
+    // [新增優化] 以輕邊與重邊兩組 CSR 取代原本單一混合的 d_row_ptr / d_adj
+    int *d_light_row_ptr = nullptr, *d_heavy_row_ptr = nullptr;
+    Edge *d_light_adj = nullptr, *d_heavy_adj = nullptr;
     int *d_dist = nullptr;
     int *d_flags = nullptr;
 
@@ -226,8 +246,10 @@ int main(int argc, char* argv[]) {
     int *d_cnts = nullptr;
 
     // ---- 配置 Device 記憶體 ----
-    cudaMalloc(&d_row_ptr, (size_t)(n + 1) * sizeof(int));
-    cudaMalloc(&d_adj, (size_t)std::max(m, 1) * sizeof(Edge));
+    cudaMalloc(&d_light_row_ptr, (size_t)(n + 1) * sizeof(int));
+    cudaMalloc(&d_heavy_row_ptr, (size_t)(n + 1) * sizeof(int));
+    cudaMalloc(&d_light_adj, (size_t)std::max(light_m, 1) * sizeof(Edge));
+    cudaMalloc(&d_heavy_adj, (size_t)std::max(heavy_m, 1) * sizeof(Edge));
     cudaMalloc(&d_dist, (size_t)std::max(n, 1) * sizeof(int));
     cudaMalloc(&d_flags, (size_t)std::max(n, 1) * sizeof(int));
     cudaMalloc(&d_pend_bufA, (size_t)std::max(n, 1) * sizeof(int));
@@ -237,10 +259,14 @@ int main(int argc, char* argv[]) {
     cudaMalloc(&d_bucket_done, (size_t)std::max(n, 1) * sizeof(int));
     cudaMalloc(&d_cnts, 6 * sizeof(int));
 
-    // ---- 將圖資料從 Host 搬到 Device ----
-    cudaMemcpy(d_row_ptr, row_ptr.data(), (size_t)(n + 1) * sizeof(int), cudaMemcpyHostToDevice);
-    if (m > 0) {
-        cudaMemcpy(d_adj, adj.data(), (size_t)m * sizeof(Edge), cudaMemcpyHostToDevice);
+    // ---- 將輕／重邊 CSR 資料從 Host 搬到 Device ----
+    cudaMemcpy(d_light_row_ptr, light_row_ptr.data(), (size_t)(n + 1) * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_heavy_row_ptr, heavy_row_ptr.data(), (size_t)(n + 1) * sizeof(int), cudaMemcpyHostToDevice);
+    if (light_m > 0) {
+        cudaMemcpy(d_light_adj, light_adj.data(), (size_t)light_m * sizeof(Edge), cudaMemcpyHostToDevice);
+    }
+    if (heavy_m > 0) {
+        cudaMemcpy(d_heavy_adj, heavy_adj.data(), (size_t)heavy_m * sizeof(Edge), cudaMemcpyHostToDevice);
     }
 
     FILE* fout = fopen(argv[2], "wb");
@@ -306,13 +332,13 @@ int main(int argc, char* argv[]) {
             current_bucket = next_bucket;
             int bucket_upper_bound = (next_bucket + 1) * delta;
 
-            // Phase 1: 同桶內輕邊閉包迭代
+            // Phase 1: 同桶內輕邊閉包迭代（[新增優化] 直接走輕邊 CSR）
             while (light_cnt > 0) {
                 cudaMemset(d_cnts + 2, 0, sizeof(int));
                 int l_blocks = (light_cnt + TPB - 1) / TPB;
                 relax_kernel<<<l_blocks, TPB>>>(
-                    d_row_ptr, d_adj, delta, d_light_frontier, light_cnt, bucket_upper_bound,
-                    true, true, d_dist, d_flags,
+                    d_light_row_ptr, d_light_adj, d_light_frontier, light_cnt, bucket_upper_bound,
+                    true, d_dist, d_flags,
                     d_next_light_frontier, d_cnts + 2, d_pend, d_cnts + 3
                 );
 
@@ -331,12 +357,12 @@ int main(int argc, char* argv[]) {
                 light_cnt = next_light_cnt;
             }
 
-            // Phase 2: 對本桶子累積的所有頂點做重邊鬆弛
-            if (bucket_done_cnt > 0) {
+            // Phase 2: 對本桶子累積的所有頂點做重邊鬆弛（[新增優化] 直接走重邊 CSR）
+            if (bucket_done_cnt > 0 && heavy_m > 0) {
                 int bd_blocks = (bucket_done_cnt + TPB - 1) / TPB;
                 relax_kernel<<<bd_blocks, TPB>>>(
-                    d_row_ptr, d_adj, delta, d_bucket_done, bucket_done_cnt, bucket_upper_bound,
-                    false, false, d_dist, d_flags,
+                    d_heavy_row_ptr, d_heavy_adj, d_bucket_done, bucket_done_cnt, bucket_upper_bound,
+                    false, d_dist, d_flags,
                     d_next_light_frontier, d_cnts + 2, d_pend, d_cnts + 3
                 );
                 cudaMemcpy(&pend_cnt, d_cnts + 3, sizeof(int), cudaMemcpyDeviceToHost);
@@ -357,8 +383,10 @@ int main(int argc, char* argv[]) {
 
     // TODO: cudaFree device arrays
     // ---- 釋放 Device 記憶體 ----
-    cudaFree(d_row_ptr);
-    cudaFree(d_adj);
+    cudaFree(d_light_row_ptr);
+    cudaFree(d_heavy_row_ptr);
+    cudaFree(d_light_adj);
+    cudaFree(d_heavy_adj);
     cudaFree(d_dist);
     cudaFree(d_flags);
     cudaFree(d_pend_bufA);
