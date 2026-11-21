@@ -3,6 +3,7 @@
 #include <climits>
 #include <vector>
 #include <algorithm>
+#include <chrono>
 #include <cuda_runtime.h>
 
 const int INF = (1 << 30) - 1;
@@ -273,15 +274,23 @@ apsp_block_per_src_kernel(const int* __restrict__ light_row_ptr,
 }
 
 int main(int argc, char* argv[]) {
+    using Clock = std::chrono::steady_clock;
+    using Ms = std::chrono::duration<double, std::milli>;
+
     if (argc < 3) {
         fprintf(stderr, "usage: %s <input> <output>\n", argv[0]);
         return 1;
     }
 
+    const auto t_start = Clock::now();
+
     // TODO: get device properties
     int dev = 0;
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, dev);
+
+    // [新增計時] 階段 1：讀檔 + 建 light / heavy 雙 CSR
+    const auto t_io_csr_begin = Clock::now();
 
     // Read input: n, m, then m edges (src, dst, weight)
     FILE* fin = fopen(argv[1], "rb");
@@ -289,11 +298,13 @@ int main(int argc, char* argv[]) {
     int n, m;
     if (fread(&n, sizeof(int), 1, fin) != 1 || fread(&m, sizeof(int), 1, fin) != 1) {
         fprintf(stderr, "bad input header\n");
+        fclose(fin);
         return 1;
     }
     std::vector<int> raw((size_t)m * 3);
     if (fread(raw.data(), sizeof(int), raw.size(), fin) != raw.size()) {
         fprintf(stderr, "truncated input\n");
+        fclose(fin);
         return 1;
     }
     fclose(fin);
@@ -340,6 +351,8 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    const double read_and_csr_ms = Ms(Clock::now() - t_io_csr_begin).count();
+
     // TODO: cudaMalloc device arrays, cudaMemcpy graph to device
     // ---- Device 端共用輕／重邊 CSR 宣告與配置 ----
     int *d_light_row_ptr = nullptr, *d_heavy_row_ptr = nullptr;
@@ -381,25 +394,54 @@ int main(int argc, char* argv[]) {
                              : per_src_bytes;
     int batch_size = (n > 0) ? (int)std::max((size_t)1, std::min((size_t)n, rem_for_out / per_src_bytes)) : 0;
 
+    const size_t max_batch_elems = (size_t)std::max(batch_size, 1) * (size_t)std::max(n, 1);
+
     int* d_out_dist = nullptr;
     int* d_block_state = nullptr;
     int* d_src_counter = nullptr;
+    int* host_batch_dist = nullptr; // [修改 Pinned] 改用 cudaMallocHost 配置 pinned 緩衝區
 
-    cudaMalloc(&d_out_dist, (size_t)std::max(batch_size, 1) * (size_t)std::max(n, 1) * sizeof(int));
+    cudaMalloc(&d_out_dist, max_batch_elems * sizeof(int));
     cudaMalloc(&d_block_state, (size_t)num_blocks * (size_t)6 * (size_t)std::max(n, 1) * sizeof(int));
     cudaMalloc(&d_src_counter, sizeof(int));
 
-    std::vector<int> host_batch_dist((size_t)std::max(batch_size, 1) * (size_t)std::max(n, 1));
+    if (cudaMallocHost(&host_batch_dist, max_batch_elems * sizeof(int)) != cudaSuccess || !host_batch_dist) {
+        fprintf(stderr, "cudaMallocHost failed\n");
+        cudaFree(d_out_dist);
+        cudaFree(d_block_state);
+        cudaFree(d_src_counter);
+        cudaFree(d_light_row_ptr);
+        cudaFree(d_heavy_row_ptr);
+        cudaFree(d_light_adj);
+        cudaFree(d_heavy_adj);
+        return 1;
+    }
 
     FILE* fout = fopen(argv[2], "wb");
-    if (!fout) { perror("open output"); return 1; }
+    if (!fout) {
+        perror("open output");
+        cudaFreeHost(host_batch_dist);
+        cudaFree(d_out_dist);
+        cudaFree(d_block_state);
+        cudaFree(d_src_counter);
+        cudaFree(d_light_row_ptr);
+        cudaFree(d_heavy_row_ptr);
+        cudaFree(d_light_adj);
+        cudaFree(d_heavy_adj);
+        return 1;
+    }
+
+    double gpu_and_d2h_ms = 0.0;
+    double fwrite_ms = 0.0;
 
     // TODO: replace whole loop with kernel launches
     // [新增 Block-per-Source] 分批啟動常駐 Block 搶算起點，批次完成後一次搬回 Host 寫檔
     for (int src_base = 0; src_base < n; src_base += batch_size) {
         const int cur_batch_count = std::min(batch_size, n - src_base);
         const int cur_blocks = std::min(num_blocks, cur_batch_count);
+        const size_t batch_elems = (size_t)cur_batch_count * (size_t)n;
 
+        const auto t_gpu_begin = Clock::now();
         cudaMemset(d_src_counter, 0, sizeof(int));
         apsp_block_per_src_kernel<TPB, GRP><<<cur_blocks, TPB>>>(
             d_light_row_ptr, d_light_adj,
@@ -411,19 +453,31 @@ int main(int argc, char* argv[]) {
         cudaDeviceSynchronize();
 
         // TODO: cudaMemcpy distances back to host
-        const size_t batch_elems = (size_t)cur_batch_count * (size_t)n;
-        cudaMemcpy(host_batch_dist.data(), d_out_dist, batch_elems * sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(host_batch_dist, d_out_dist, batch_elems * sizeof(int), cudaMemcpyDeviceToHost);
+        gpu_and_d2h_ms += Ms(Clock::now() - t_gpu_begin).count();
 
-        if (fwrite(host_batch_dist.data(), sizeof(int), batch_elems, fout) != batch_elems) {
+        // [新增計時] 階段 3：fwrite 寫出結果
+        const auto t_fwrite_begin = Clock::now();
+        if (fwrite(host_batch_dist, sizeof(int), batch_elems, fout) != batch_elems) {
             perror("write output");
             fclose(fout);
+            cudaFreeHost(host_batch_dist);
+            cudaFree(d_out_dist);
+            cudaFree(d_block_state);
+            cudaFree(d_src_counter);
+            cudaFree(d_light_row_ptr);
+            cudaFree(d_heavy_row_ptr);
+            cudaFree(d_light_adj);
+            cudaFree(d_heavy_adj);
             return 1;
         }
+        fwrite_ms += Ms(Clock::now() - t_fwrite_begin).count();
     }
     fclose(fout);
 
     // TODO: cudaFree device arrays
-    // ---- 釋放 Device 記憶體 ----
+    // ---- 釋放 Host Pinned 與 Device 記憶體 ----
+    cudaFreeHost(host_batch_dist); // [修改 Pinned] 對應 cudaMallocHost 釋放
     cudaFree(d_out_dist);
     cudaFree(d_block_state);
     cudaFree(d_src_counter);
@@ -431,6 +485,11 @@ int main(int argc, char* argv[]) {
     cudaFree(d_heavy_row_ptr);
     cudaFree(d_light_adj);
     cudaFree(d_heavy_adj);
+
+    const double total_host_ms = Ms(Clock::now() - t_start).count();
+    fprintf(stderr,
+            "[Timing] read+build_CSR: %.3f ms | gpu+sync+D2H: %.3f ms | fwrite: %.3f ms | total_host: %.3f ms\n",
+            read_and_csr_ms, gpu_and_d2h_ms, fwrite_ms, total_host_ms);
 
     return 0;
 }
