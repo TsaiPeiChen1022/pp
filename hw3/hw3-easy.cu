@@ -1,4 +1,4 @@
-// 版本 v1 = 原始 v6 + [優化1] 小 chunk（pinned / 輸出 buffer 約 128 MB）
+// 版本 v2 = v1 + [優化2] 雙 stream 流水線（計算 / D2H / fwrite 重疊）
 #include <cstdio>
 #include <cstdlib>
 #include <climits>
@@ -395,110 +395,121 @@ int main(int argc, char* argv[]) {
                              : per_src_bytes;
     int batch_size = (n > 0) ? (int)std::max((size_t)1, std::min((size_t)n, rem_for_out / per_src_bytes)) : 0;
 
+    // [優化2] 改用 2 組 stream 輪流：GPU 算下一批時，Host 同時 fwrite 上一批。
+    //         每個 stream 各自擁有 d_out_dist / d_block_state / pinned buffer，
+    //         為了和 v1 的「總常駐 Block 數」相同，每個 stream 只啟動 num_blocks / 2 個 Block。
+    const int num_blocks_per = std::max(1, num_blocks / 2);
+
     // [優化1] 原本 batch_size 只受「剩餘顯存」限制，會讓 d_out_dist 和 pinned buffer 變成數 GB，
     //         nsys timeline 上 cudaHostAlloc 約佔 1.5 s。改成每批輸出上限約 128 MB，
     //         pinned buffer 因此只剩 128 MB，配置時間幾乎可忽略。
     {
         const size_t chunk_bytes = (size_t)128 << 20;
-        const size_t cap = std::max((size_t)num_blocks * 3, chunk_bytes / per_src_bytes);  // 至少讓每個 Block 有 3 個 src 可做
+        const size_t cap = std::max((size_t)num_blocks_per * 3, chunk_bytes / per_src_bytes);  // 至少讓每個 Block 有 3 個 src 可做
         batch_size = (int)std::max((size_t)1, std::min((size_t)batch_size, cap));
     }
 
     const size_t max_batch_elems = (size_t)std::max(batch_size, 1) * (size_t)std::max(n, 1);
 
-    int* d_out_dist = nullptr;
-    int* d_block_state = nullptr;
-    int* d_src_counter = nullptr;
-    int* host_batch_dist = nullptr; // [修改 Pinned] 改用 cudaMallocHost 配置 pinned 緩衝區
+    // [優化2] 兩組 (stream / d_out_dist / d_block_state / pinned buffer) 輪流使用
+    int* d_out_dist[2] = {nullptr, nullptr};
+    int* d_block_state[2] = {nullptr, nullptr};
+    int* d_src_counter = nullptr;               // 兩個 stream 各用一個計數器 (d_src_counter + t)
+    int* host_batch_dist[2] = {nullptr, nullptr}; // [修改 Pinned] 改用 cudaMallocHost 配置 pinned 緩衝區
+    cudaStream_t stream[2];
 
-    cudaMalloc(&d_out_dist, max_batch_elems * sizeof(int));
-    cudaMalloc(&d_block_state, (size_t)num_blocks * (size_t)6 * (size_t)std::max(n, 1) * sizeof(int));
-    cudaMalloc(&d_src_counter, sizeof(int));
+    cudaMalloc(&d_src_counter, 2 * sizeof(int));
+    for (int t = 0; t < 2; ++t) {
+        cudaStreamCreate(&stream[t]);
+        cudaMalloc(&d_out_dist[t], max_batch_elems * sizeof(int));
+        cudaMalloc(&d_block_state[t], (size_t)num_blocks_per * (size_t)6 * (size_t)std::max(n, 1) * sizeof(int));
+        if (cudaMallocHost(&host_batch_dist[t], max_batch_elems * sizeof(int)) != cudaSuccess || !host_batch_dist[t]) {
+            fprintf(stderr, "cudaMallocHost failed\n");
+            return 1;
+        }
+    }
 
-    if (cudaMallocHost(&host_batch_dist, max_batch_elems * sizeof(int)) != cudaSuccess || !host_batch_dist) {
-        fprintf(stderr, "cudaMallocHost failed\n");
-        cudaFree(d_out_dist);
-        cudaFree(d_block_state);
+    // [優化2] 所有 Device / Host 資源集中在這裡釋放（錯誤路徑與正常結束共用）
+    auto release_all = [&]() {
+        for (int t = 0; t < 2; ++t) {
+            cudaFreeHost(host_batch_dist[t]);
+            cudaFree(d_out_dist[t]);
+            cudaFree(d_block_state[t]);
+            cudaStreamDestroy(stream[t]);
+        }
         cudaFree(d_src_counter);
         cudaFree(d_light_row_ptr);
         cudaFree(d_heavy_row_ptr);
         cudaFree(d_light_adj);
         cudaFree(d_heavy_adj);
-        return 1;
-    }
+    };
 
     FILE* fout = fopen(argv[2], "wb");
     if (!fout) {
         perror("open output");
-        cudaFreeHost(host_batch_dist);
-        cudaFree(d_out_dist);
-        cudaFree(d_block_state);
-        cudaFree(d_src_counter);
-        cudaFree(d_light_row_ptr);
-        cudaFree(d_heavy_row_ptr);
-        cudaFree(d_light_adj);
-        cudaFree(d_heavy_adj);
+        release_all();
         return 1;
     }
 
-    double gpu_and_d2h_ms = 0.0;
+    double gpu_and_d2h_ms = 0.0;   // [優化2] 現在代表 Host 「等 GPU(kernel + D2H) 的時間」，已與 fwrite 重疊
     double fwrite_ms = 0.0;
 
+    const int num_batches = (n + batch_size - 1) / batch_size;
+
+    // [優化2] 等第 b 批的 stream 完成後再 fwrite
+    auto write_batch = [&](int b) {
+        const int t = b & 1;
+        const size_t cnt = std::min((size_t)batch_size, (size_t)n - (size_t)b * (size_t)batch_size);
+        const auto t_w0 = Clock::now();
+        cudaStreamSynchronize(stream[t]);
+        const auto t_w1 = Clock::now();
+        gpu_and_d2h_ms += Ms(t_w1 - t_w0).count();
+
+        // [新增計時] 階段 3：fwrite 寫出結果
+        if (fwrite(host_batch_dist[t], sizeof(int), cnt * (size_t)n, fout) != cnt * (size_t)n) {
+            perror("write output");
+            fclose(fout);
+            release_all();
+            exit(1);
+        }
+        fwrite_ms += Ms(Clock::now() - t_w1).count();
+    };
+
     // TODO: replace whole loop with kernel launches
-    // [新增 Block-per-Source] 分批啟動常駐 Block 搶算起點，批次完成後一次搬回 Host 寫檔
-    for (int src_base = 0; src_base < n; src_base += batch_size) {
+    // [新增 Block-per-Source] 分批啟動常駐 Block 搶算起點
+    // [優化2] 不再每批 cudaDeviceSynchronize；改成 launch -> D2H(async) -> 寫上一批
+    for (int b = 0; b < num_batches; ++b) {
+        const int t = b & 1;
+        const int src_base = b * batch_size;
         const int cur_batch_count = std::min(batch_size, n - src_base);
-        const int cur_blocks = std::min(num_blocks, cur_batch_count);
+        const int cur_blocks = std::min(num_blocks_per, cur_batch_count);
         const size_t batch_elems = (size_t)cur_batch_count * (size_t)n;
 
-        const auto t_gpu_begin = Clock::now();
-        cudaMemset(d_src_counter, 0, sizeof(int));
-        apsp_block_per_src_kernel<TPB, GRP><<<cur_blocks, TPB>>>(
+        cudaMemsetAsync(d_src_counter + t, 0, sizeof(int), stream[t]);
+        apsp_block_per_src_kernel<TPB, GRP><<<cur_blocks, TPB, 0, stream[t]>>>(
             d_light_row_ptr, d_light_adj,
             d_heavy_row_ptr, d_heavy_adj,
             n, delta,
             src_base, cur_batch_count,
-            d_out_dist, d_block_state, d_src_counter
+            d_out_dist[t], d_block_state[t], d_src_counter + t
         );
-        cudaDeviceSynchronize();
 
         // TODO: cudaMemcpy distances back to host
-        cudaMemcpy(host_batch_dist, d_out_dist, batch_elems * sizeof(int), cudaMemcpyDeviceToHost);
-        gpu_and_d2h_ms += Ms(Clock::now() - t_gpu_begin).count();
+        cudaMemcpyAsync(host_batch_dist[t], d_out_dist[t], batch_elems * sizeof(int),
+                        cudaMemcpyDeviceToHost, stream[t]);
 
-        // [新增計時] 階段 3：fwrite 寫出結果
-        const auto t_fwrite_begin = Clock::now();
-        if (fwrite(host_batch_dist, sizeof(int), batch_elems, fout) != batch_elems) {
-            perror("write output");
-            fclose(fout);
-            cudaFreeHost(host_batch_dist);
-            cudaFree(d_out_dist);
-            cudaFree(d_block_state);
-            cudaFree(d_src_counter);
-            cudaFree(d_light_row_ptr);
-            cudaFree(d_heavy_row_ptr);
-            cudaFree(d_light_adj);
-            cudaFree(d_heavy_adj);
-            return 1;
-        }
-        fwrite_ms += Ms(Clock::now() - t_fwrite_begin).count();
+        if (b > 0) write_batch(b - 1);   // 上一批的 fwrite 與這一批的 GPU 計算重疊
     }
+    write_batch(num_batches - 1);
     fclose(fout);
 
     // TODO: cudaFree device arrays
     // ---- 釋放 Host Pinned 與 Device 記憶體 ----
-    cudaFreeHost(host_batch_dist); // [修改 Pinned] 對應 cudaMallocHost 釋放
-    cudaFree(d_out_dist);
-    cudaFree(d_block_state);
-    cudaFree(d_src_counter);
-    cudaFree(d_light_row_ptr);
-    cudaFree(d_heavy_row_ptr);
-    cudaFree(d_light_adj);
-    cudaFree(d_heavy_adj);
+    release_all();
 
     const double total_host_ms = Ms(Clock::now() - t_start).count();
     fprintf(stderr,
-            "[Timing] read+build_CSR: %.3f ms | gpu+sync+D2H: %.3f ms | fwrite: %.3f ms | total_host: %.3f ms\n",
+            "[Timing] read+build_CSR: %.3f ms | host_wait_gpu(sync): %.3f ms | fwrite: %.3f ms | total_host: %.3f ms\n",
             read_and_csr_ms, gpu_and_d2h_ms, fwrite_ms, total_host_ms);
 
     return 0;
