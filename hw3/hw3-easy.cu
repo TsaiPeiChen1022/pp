@@ -1,3 +1,4 @@
+// 版本 v1 = 原始 v6 + [優化1] 小 chunk（pinned / 輸出 buffer 約 128 MB）
 #include <cstdio>
 #include <cstdlib>
 #include <climits>
@@ -393,6 +394,15 @@ int main(int argc, char* argv[]) {
                              ? (usable_bytes - (size_t)num_blocks * per_block_state_bytes)
                              : per_src_bytes;
     int batch_size = (n > 0) ? (int)std::max((size_t)1, std::min((size_t)n, rem_for_out / per_src_bytes)) : 0;
+
+    // [優化1] 原本 batch_size 只受「剩餘顯存」限制，會讓 d_out_dist 和 pinned buffer 變成數 GB，
+    //         nsys timeline 上 cudaHostAlloc 約佔 1.5 s。改成每批輸出上限約 128 MB，
+    //         pinned buffer 因此只剩 128 MB，配置時間幾乎可忽略。
+    {
+        const size_t chunk_bytes = (size_t)128 << 20;
+        const size_t cap = std::max((size_t)num_blocks * 3, chunk_bytes / per_src_bytes);  // 至少讓每個 Block 有 3 個 src 可做
+        batch_size = (int)std::max((size_t)1, std::min((size_t)batch_size, cap));
+    }
 
     const size_t max_batch_elems = (size_t)std::max(batch_size, 1) * (size_t)std::max(n, 1);
 
