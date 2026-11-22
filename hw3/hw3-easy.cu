@@ -1,4 +1,4 @@
-// 版本 v2 = v1 + [優化2] 雙 stream 流水線（計算 / D2H / fwrite 重疊）
+// 版本 v5 = v4 + [優化5] 上界剪枝（dv + w > U 就 break）
 #include <cstdio>
 #include <cstdlib>
 #include <climits>
@@ -21,15 +21,47 @@ struct Edge {
 
 // TODO: add kernels: init distances, relax frontier edges (atomicMin / atomicAdd), find next bucket
 
+// [優化5] 上界剪枝用的輔助函式
+__device__ __forceinline__ int warp_max(int v) {
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = max(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
+// [優化5] 當「所有頂點都已到達」(s_reached == n) 後，U = 目前所有 tentative 距離的最大值。
+//         tentative 距離只會變小，所以 U 永遠是所有最終距離的合法上界；
+//         鬆弛邊時若 dv + w > U，該邊不可能改善任何頂點（dist[to] <= U），
+//         而每個頂點的邊依權重排序，後面的邊只會更大 -> 可以直接 break。
+//         有不可達頂點時 s_reached 永遠 < n，不會啟用剪枝，結果不受影響。
+//         整個 Block 必須一起呼叫（內含 __syncthreads）。
+template <int T>
+__device__ __forceinline__ void update_bound(const int* dist, int n, int tid,
+                                             const int* s_reached, int* s_U, int* s_doU,
+                                             int& U, int& work, int thresh) {
+    if (tid == 0) *s_doU = (*s_reached == n) && (U == INT_MAX || work >= thresh);
+    __syncthreads();
+    if (*s_doU) {
+        if (tid == 0) *s_U = 0;
+        __syncthreads();
+        int lm = 0;
+        for (int v = tid; v < n; v += T) lm = max(lm, dist[v]);
+        lm = warp_max(lm);
+        if ((tid & 31) == 0) atomicMax(s_U, lm);
+        __syncthreads();
+        U = *s_U;
+        work = 0;
+    }
+}
+
 // [新增 Block-per-Source] 每個 Block 獨立負責多個起點（動態搶號），完整跑完單一 src 的 Delta-Stepping
 // T: 每個 Block 的執行緒數；G: 幾個執行緒一組（sub-warp）共同走訪同一個頂點的鄰接邊
 template <int T, int G>
 __global__ void __launch_bounds__(T)
-apsp_block_per_src_kernel(const int* __restrict__ light_row_ptr,
-                          const Edge* __restrict__ light_adj,
-                          const int* __restrict__ heavy_row_ptr,
-                          const Edge* __restrict__ heavy_adj,
+apsp_block_per_src_kernel(const int* __restrict__ row_ptr,      // [優化4] 單一 CSR 的列起點
+                          const int* __restrict__ mid,          // [優化4] 輕邊 / 重邊分界
+                          const unsigned* __restrict__ adj,     // [優化4] 4 bytes 壓縮邊 (w<<16)|to
                           int n, int delta,
+                          int prune,                            // [優化5] 是否啟用上界剪枝
                           int src_base, int src_count,
                           int* __restrict__ d_out_dist,
                           int* __restrict__ d_block_state,
@@ -45,11 +77,13 @@ apsp_block_per_src_kernel(const int* __restrict__ light_row_ptr,
     __shared__ int s_cur_cnt;
     __shared__ int s_nxt_cnt;
     __shared__ int s_R_cnt;
+    __shared__ int s_reached, s_U, s_doU;   // [優化5] 已到達頂點數 / 上界 U / 是否重算 U
 
     const int tid = threadIdx.x;
     const int grp = tid / G;
     const int lane = tid % G;
     constexpr int ngrp = T / G;
+    const int thresh = max(512, n / 4);      // [優化5] 每處理約 n/4 個頂點才重算一次 U
 
     // 每個 Block 獨佔 6 * n 個 int 的工作區：
     // [0..n-1] flags, [n..2n-1] pendA, [2n..3n-1] pendB, [3n..4n-1] cur, [4n..5n-1] nxt, [5n..6n-1] R
@@ -92,11 +126,14 @@ apsp_block_per_src_kernel(const int* __restrict__ light_row_ptr,
             s_nxt_cnt = 0;
             s_R_cnt = 0;
             s_cb = -1;
+            s_reached = 1;                       // [優化5] 起點自己算已到達
         }
         __syncthreads();
 
         int* pend = pendA;
         int* next_pend = pendB;
+        int U = INT_MAX;                         // [優化5] INT_MAX = 尚未啟用剪枝
+        int work = 0;
 
         while (true) {
             // 1. 尋找目前 pending 中、桶號 > s_cb 的最小桶號
@@ -173,23 +210,28 @@ apsp_block_per_src_kernel(const int* __restrict__ light_row_ptr,
 
             // 3. Phase 1：同桶內輕邊閉包迭代（由 G 個 thread 協作掃描單一頂點的輕邊）
             while (s_cur_cnt > 0) {
+                if (prune) update_bound<T>(dist, n, tid, &s_reached, &s_U, &s_doU, U, work, thresh);  // [優化5]
                 const int cc = s_cur_cnt;
+                work += cc;
                 for (int i = grp; i < cc; i += ngrp) {
                     int v = cur[i];
                     int dv = dist[v];
                     if (dv >= INF) continue;
 
-                    int e_begin = light_row_ptr[v];
-                    int e_end = light_row_ptr[v + 1];
+                    int e_begin = row_ptr[v];       // [優化4] 輕邊範圍 [row_ptr[v], mid[v])
+                    int e_end = mid[v];
                     for (int e = e_begin + lane; e < e_end; e += G) {
-                        Edge edge = light_adj[e];
+                        const unsigned pk = adj[e];     // [優化4] 解開壓縮邊
+                        Edge edge = Edge{(int)(pk & 0xFFFFu), (int)(pk >> 16)};
                         long long nd_ll = (long long)dv + (long long)edge.w;
+                        if (nd_ll > U) break;      // [優化5] 邊已排序，後面的邊只會更大，不可能再改善
                         if (nd_ll >= INF) continue;
                         int nd = (int)nd_ll;
                         int u = edge.to;
 
                         if (nd < dist[u]) {
                             int old = atomicMin(&dist[u], nd);
+                            if (old == INF) atomicAdd(&s_reached, 1);   // [優化5] 第一次被到達
                             if (nd < old) {
                                 if ((long long)nd < bound) {
                                     if ((flags[u] & FLAG_IN_NEXT_LIGHT) == 0) {
@@ -233,6 +275,7 @@ apsp_block_per_src_kernel(const int* __restrict__ light_row_ptr,
             }
 
             // 4. Phase 2：對本桶所有累積頂點 R 鬆弛重邊
+            if (prune) update_bound<T>(dist, n, tid, &s_reached, &s_U, &s_doU, U, work, thresh);      // [優化5]
             const int rc = s_R_cnt;
             if (rc > 0) {
                 for (int i = grp; i < rc; i += ngrp) {
@@ -240,17 +283,20 @@ apsp_block_per_src_kernel(const int* __restrict__ light_row_ptr,
                     int dv = dist[v];
                     if (dv >= INF) continue;
 
-                    int e_begin = heavy_row_ptr[v];
-                    int e_end = heavy_row_ptr[v + 1];
+                    int e_begin = mid[v];           // [優化4] 重邊範圍 [mid[v], row_ptr[v+1])
+                    int e_end = row_ptr[v + 1];
                     for (int e = e_begin + lane; e < e_end; e += G) {
-                        Edge edge = heavy_adj[e];
+                        const unsigned pk = adj[e];     // [優化4] 解開壓縮邊
+                        Edge edge = Edge{(int)(pk & 0xFFFFu), (int)(pk >> 16)};
                         long long nd_ll = (long long)dv + (long long)edge.w;
+                        if (nd_ll > U) break;      // [優化5] 邊已排序，後面的邊只會更大，不可能再改善
                         if (nd_ll >= INF) continue;
                         int nd = (int)nd_ll;
                         int u = edge.to;
 
                         if (nd < dist[u]) {
                             int old = atomicMin(&dist[u], nd);
+                            if (old == INF) atomicAdd(&s_reached, 1);   // [優化5] 第一次被到達
                             if (nd < old) {
                                 if ((flags[u] & FLAG_IN_PEND) == 0) {
                                     if ((atomicOr(&flags[u], FLAG_IN_PEND) & FLAG_IN_PEND) == 0) {
@@ -274,6 +320,83 @@ apsp_block_per_src_kernel(const int* __restrict__ light_row_ptr,
     }
 }
 
+// ---- [優化3] GPU 建圖 kernel 開始 ----
+// [優化4] 單一 CSR：先依 src 分組（count + scatter，和 v3 相同），再「一個 Block 負責一個頂點」
+//         用 shared memory 的 counting sort 把該頂點的邊依權重由小到大排好（w <= 1000 < 1024 個 bin）。
+//         邊同時壓成 4 bytes：(w << 16) | to（原本 Edge 8 bytes）。
+
+// 第 1 趟：每個頂點的出度 + w 總和（取代 wsum_kernel）
+__global__ void count_src_kernel(const int* __restrict__ raw, size_t m, int* __restrict__ cnt,
+                                 unsigned long long* __restrict__ wsum) {
+    unsigned long long local = 0;
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < m; i += stride) {
+        atomicAdd(&cnt[raw[i * 3]], 1);
+        local += (unsigned)raw[i * 3 + 2];
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) local += __shfl_down_sync(0xffffffffu, local, o);
+    if ((threadIdx.x & 31) == 0) atomicAdd(wsum, local);
+}
+
+// 第 2 趟：依 src 分組 scatter，內容是壓縮邊 (w << 16) | dst（組內順序不拘）
+__global__ void scatter_src_kernel(const int* __restrict__ raw, size_t m, int* __restrict__ cur,
+                                   unsigned* __restrict__ tmp) {
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < m; i += stride) {
+        const int pos = atomicAdd(&cur[raw[i * 3]], 1);
+        tmp[pos] = ((unsigned)raw[i * 3 + 2] << 16) | (unsigned)raw[i * 3 + 1];
+    }
+}
+
+// 第 3 趟：一個 Block (1024 threads) 負責一個頂點，依權重做 counting sort
+__global__ void __launch_bounds__(1024)
+sort_by_w_kernel(const int* __restrict__ row, const unsigned* __restrict__ tmp, unsigned* __restrict__ adj) {
+    __shared__ int hist[1024];
+    __shared__ int scan[1024];
+    __shared__ int cur[1024];
+    const int tid = threadIdx.x;
+    const int v = blockIdx.x;
+    const int b = row[v], e = row[v + 1];
+
+    hist[tid] = 0;
+    __syncthreads();
+    for (int i = b + tid; i < e; i += 1024) atomicAdd(&hist[tmp[i] >> 16], 1);
+    __syncthreads();
+
+    const int val = hist[tid];
+    scan[tid] = val;
+    __syncthreads();
+    for (int off = 1; off < 1024; off <<= 1) {       // Hillis-Steele inclusive scan
+        const int x = (tid >= off) ? scan[tid - off] : 0;
+        __syncthreads();
+        scan[tid] += x;
+        __syncthreads();
+    }
+    cur[tid] = scan[tid] - val;                      // exclusive prefix = 該權重的起始位置
+    __syncthreads();
+
+    for (int i = b + tid; i < e; i += 1024) {
+        const unsigned p = tmp[i];
+        const int pos = atomicAdd(&cur[p >> 16], 1);
+        adj[b + pos] = p;
+    }
+}
+
+// mid[v] = 頂點 v 第一條「重邊 (w > delta)」的位置；因為邊依權重排序，用二分搜尋即可
+__global__ void mid_kernel(const int* __restrict__ row, const unsigned* __restrict__ adj,
+                           int* __restrict__ mid, int n, int delta) {
+    int v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n) return;
+    int lo = row[v], hi = row[v + 1];
+    while (lo < hi) {
+        int md = (lo + hi) >> 1;
+        if ((int)(adj[md] >> 16) <= delta) lo = md + 1; else hi = md;
+    }
+    mid[v] = lo;
+}
+// ---- [優化3] GPU 建圖 kernel 結束 ----
+
 int main(int argc, char* argv[]) {
     using Clock = std::chrono::steady_clock;
     using Ms = std::chrono::duration<double, std::milli>;
@@ -290,7 +413,8 @@ int main(int argc, char* argv[]) {
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, dev);
 
-    // [新增計時] 階段 1：讀檔 + 建 light / heavy 雙 CSR
+    // ---- [優化3] GPU 建圖 開始 ----
+    // [新增計時] 階段 1：讀檔 + 建 CSR（[優化3] 之後 CSR 在 GPU 上建）
     const auto t_io_csr_begin = Clock::now();
 
     // Read input: n, m, then m edges (src, dst, weight)
@@ -302,76 +426,107 @@ int main(int argc, char* argv[]) {
         fclose(fin);
         return 1;
     }
-    std::vector<int> raw((size_t)m * 3);
-    if (fread(raw.data(), sizeof(int), raw.size(), fin) != raw.size()) {
-        fprintf(stderr, "truncated input\n");
+    if (n > 65535) {   // [優化3] src / dst 需塞進 16 bits（hw3-1 的 V 上限是 40000，不會觸發）
+        fprintf(stderr, "n too large\n");
         fclose(fin);
         return 1;
     }
+
+    // [優化3] 原本是 std::vector<int> raw(3m) 一次 fread，之後在 CPU 兩趟建 CSR。
+    //         現在改成：每次 fread 約 12 MB 到 pinned staging，再 cudaMemcpyAsync 到 device 的 d_raw，
+    //         讀檔與 H2D 重疊，CPU 不再保留整份 raw。
+    int* d_raw = nullptr;
+    if (m > 0) cudaMalloc(&d_raw, (size_t)m * 3 * sizeof(int));
+    {
+        const size_t CHE = (size_t)1 << 20;   // 每段 1M 條邊
+        int* stage[2];
+        cudaEvent_t ev[2];
+        for (int i = 0; i < 2; ++i) {
+            cudaMallocHost(&stage[i], CHE * 3 * sizeof(int));
+            cudaEventCreate(&ev[i]);
+            cudaEventRecord(ev[i], 0);
+        }
+        size_t it = 0;
+        for (size_t e0 = 0; e0 < (size_t)m; e0 += CHE, ++it) {
+            const size_t cnt = std::min(CHE, (size_t)m - e0);
+            const int k = (int)(it & 1);
+            cudaEventSynchronize(ev[k]);      // 這個 staging buffer 上一次的 copy 已完成
+            if (fread(stage[k], sizeof(int), cnt * 3, fin) != cnt * 3) {
+                fprintf(stderr, "truncated input\n");
+                fclose(fin);
+                return 1;
+            }
+            cudaMemcpyAsync(d_raw + e0 * 3, stage[k], cnt * 3 * sizeof(int), cudaMemcpyHostToDevice, 0);
+            cudaEventRecord(ev[k], 0);
+        }
+        cudaDeviceSynchronize();
+        for (int i = 0; i < 2; ++i) { cudaFreeHost(stage[i]); cudaEventDestroy(ev[i]); }
+    }
     fclose(fin);
 
+    // [優化4] 改成「單一 CSR」：d_row_ptr / d_adj（每個頂點的邊依權重排序、4 bytes 壓縮）
+    //         加上 d_mid（輕邊 / 重邊的分界）。原本的 light_*、heavy_* 兩份 row_ptr 與 Edge 陣列都不需要了。
+    // TODO: cudaMalloc device arrays, cudaMemcpy graph to device
+    int *d_row_ptr = nullptr, *d_mid = nullptr;
+    unsigned* d_adj = nullptr;
+    cudaMalloc(&d_row_ptr, (size_t)(n + 1) * sizeof(int));
+    cudaMalloc(&d_mid, (size_t)std::max(n, 1) * sizeof(int));
+
+    unsigned long long* d_wsum = nullptr;
+    cudaMalloc(&d_wsum, sizeof(unsigned long long));
+    cudaMemset(d_wsum, 0, sizeof(unsigned long long));
+    const int kb = (int)std::max<size_t>(1, std::min<size_t>(((size_t)m + 255) / 256, 8192));
+
+    std::vector<int> row_ptr(n + 1, 0);
+    if (m > 0) {
+        int* d_cnt = nullptr;                                   // 先當出度計數器，之後當 scatter 游標
+        cudaMalloc(&d_cnt, (size_t)n * sizeof(int));
+        cudaMemset(d_cnt, 0, (size_t)n * sizeof(int));
+        count_src_kernel<<<kb, 256>>>(d_raw, (size_t)m, d_cnt, d_wsum);
+
+        std::vector<int> h_cnt(n);
+        cudaMemcpy(h_cnt.data(), d_cnt, (size_t)n * sizeof(int), cudaMemcpyDeviceToHost);
+        for (int v = 0; v < n; ++v) row_ptr[v + 1] = row_ptr[v] + h_cnt[v];   // prefix sum
+        cudaMemcpy(d_row_ptr, row_ptr.data(), (size_t)(n + 1) * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_cnt, row_ptr.data(), (size_t)n * sizeof(int), cudaMemcpyHostToDevice);  // 游標 = row_ptr
+
+        unsigned* d_tmp = nullptr;
+        cudaMalloc(&d_tmp, (size_t)m * sizeof(unsigned));
+        cudaMalloc(&d_adj, (size_t)m * sizeof(unsigned));
+        scatter_src_kernel<<<kb, 256>>>(d_raw, (size_t)m, d_cnt, d_tmp);
+        cudaFree(d_raw);
+        d_raw = nullptr;
+
+        sort_by_w_kernel<<<n, 1024>>>(d_row_ptr, d_tmp, d_adj);  // 每個頂點的邊依權重排序
+        cudaDeviceSynchronize();
+        cudaFree(d_tmp);
+        cudaFree(d_cnt);
+    } else {
+        cudaMalloc(&d_adj, sizeof(unsigned));
+        cudaMemset(d_row_ptr, 0, (size_t)(n + 1) * sizeof(int));
+    }
+
+    unsigned long long h_wsum = 0;
+    cudaMemcpy(&h_wsum, d_wsum, sizeof(h_wsum), cudaMemcpyDeviceToHost);
+    cudaFree(d_wsum);
+
     // Bucket width: same default as hw3-1.cu
-    long long wsum = 0;
-    for (int i = 0; i < m; ++i) wsum += raw[3 * i + 2];
+    const long long wsum = (long long)h_wsum;
     const double avg_w = m > 0 ? (double)wsum / m : 1.0;
     const double avg_deg = n > 0 ? std::max(1.0, (double)m / n) : 1.0;
     int delta = std::max(1, (int)(avg_w * 32.0 / avg_deg));
     if (const char* s = getenv("HW3_DELTA")) delta = std::max(1, atoi(s));
 
-    // 建立兩份 CSR：輕邊（w <= delta）與重邊（w > delta）分開存放
-    std::vector<int> light_row_ptr(n + 1, 0), heavy_row_ptr(n + 1, 0);
-    for (int i = 0; i < m; ++i) {
-        const int src = raw[3 * i];
-        const int w = raw[3 * i + 2];
-        if (w <= delta) {
-            light_row_ptr[src + 1]++;
-        } else {
-            heavy_row_ptr[src + 1]++;
-        }
-    }
-    for (int v = 0; v < n; ++v) {
-        light_row_ptr[v + 1] += light_row_ptr[v];
-        heavy_row_ptr[v + 1] += heavy_row_ptr[v];
-    }
+    // [優化5] 稠密圖 (平均出度 >= 16) 才啟用上界剪枝；可用 HW3_PRUNE=0/1 強制關閉/開啟
+    int prune = avg_deg >= 16 ? 1 : 0;
+    if (const char* s = getenv("HW3_PRUNE")) prune = atoi(s) ? 1 : 0;
 
-    const int light_m = light_row_ptr[n];
-    const int heavy_m = heavy_row_ptr[n];
-    std::vector<Edge> light_adj(std::max(light_m, 1));
-    std::vector<Edge> heavy_adj(std::max(heavy_m, 1));
-    std::vector<int> light_next(light_row_ptr.begin(), light_row_ptr.end() - 1);
-    std::vector<int> heavy_next(heavy_row_ptr.begin(), heavy_row_ptr.end() - 1);
+    // [優化4] delta 決定後才算 mid[v]
+    mid_kernel<<<(n + 255) / 256, 256>>>(d_row_ptr, d_adj, d_mid, n, delta);
 
-    for (int i = 0; i < m; ++i) {
-        const int src = raw[3 * i];
-        const int dst = raw[3 * i + 1];
-        const int w = raw[3 * i + 2];
-        if (w <= delta) {
-            light_adj[light_next[src]++] = Edge{dst, w};
-        } else {
-            heavy_adj[heavy_next[src]++] = Edge{dst, w};
-        }
-    }
-
+    cudaDeviceSynchronize();
     const double read_and_csr_ms = Ms(Clock::now() - t_io_csr_begin).count();
-
-    // TODO: cudaMalloc device arrays, cudaMemcpy graph to device
-    // ---- Device 端共用輕／重邊 CSR 宣告與配置 ----
-    int *d_light_row_ptr = nullptr, *d_heavy_row_ptr = nullptr;
-    Edge *d_light_adj = nullptr, *d_heavy_adj = nullptr;
-
-    cudaMalloc(&d_light_row_ptr, (size_t)(n + 1) * sizeof(int));
-    cudaMalloc(&d_heavy_row_ptr, (size_t)(n + 1) * sizeof(int));
-    cudaMalloc(&d_light_adj, (size_t)std::max(light_m, 1) * sizeof(Edge));
-    cudaMalloc(&d_heavy_adj, (size_t)std::max(heavy_m, 1) * sizeof(Edge));
-
-    cudaMemcpy(d_light_row_ptr, light_row_ptr.data(), (size_t)(n + 1) * sizeof(int), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_heavy_row_ptr, heavy_row_ptr.data(), (size_t)(n + 1) * sizeof(int), cudaMemcpyHostToDevice);
-    if (light_m > 0) {
-        cudaMemcpy(d_light_adj, light_adj.data(), (size_t)light_m * sizeof(Edge), cudaMemcpyHostToDevice);
-    }
-    if (heavy_m > 0) {
-        cudaMemcpy(d_heavy_adj, heavy_adj.data(), (size_t)heavy_m * sizeof(Edge), cudaMemcpyHostToDevice);
-    }
+    // ---- [優化3] GPU 建圖 結束 ----
 
     // [新增 Block-per-Source] 依可用顯存決定每批處理的起點數與常駐 Block 數
     constexpr int TPB = 256;
@@ -438,10 +593,9 @@ int main(int argc, char* argv[]) {
             cudaStreamDestroy(stream[t]);
         }
         cudaFree(d_src_counter);
-        cudaFree(d_light_row_ptr);
-        cudaFree(d_heavy_row_ptr);
-        cudaFree(d_light_adj);
-        cudaFree(d_heavy_adj);
+        cudaFree(d_row_ptr);            // [優化4]
+        cudaFree(d_mid);
+        cudaFree(d_adj);
     };
 
     FILE* fout = fopen(argv[2], "wb");
@@ -487,9 +641,8 @@ int main(int argc, char* argv[]) {
 
         cudaMemsetAsync(d_src_counter + t, 0, sizeof(int), stream[t]);
         apsp_block_per_src_kernel<TPB, GRP><<<cur_blocks, TPB, 0, stream[t]>>>(
-            d_light_row_ptr, d_light_adj,
-            d_heavy_row_ptr, d_heavy_adj,
-            n, delta,
+            d_row_ptr, d_mid, d_adj,        // [優化4]
+            n, delta, prune,                // [優化5]
             src_base, cur_batch_count,
             d_out_dist[t], d_block_state[t], d_src_counter + t
         );
